@@ -51,17 +51,56 @@ LOW_COVERAGE = 0.60
 # Locations listed per duplicate block; the occurrence count is never truncated.
 DUPLICATE_LOCATIONS = 4  # a normalized clone must span at least this many SLOC
 
-# Baseline bands from SlopCodeBench / earendil.com (mean +/- sd).
-BANDS = {
-    "verbosity": {"human": 0.15, "human_sd": 0.06, "agent": 0.33, "agent_sd": 0.10},
-    "erosion": {"human": 0.31, "human_sd": 0.17, "agent": 0.68, "agent_sd": 0.20},
-    # Granularity has a human reference band but no agent band: SlopCodeBench
-    # never measured it, and our own agent sample is not comparable. Derived
-    # from the same human panel at HEAD (44 of 48 repos measurable), mean +/- sd
-    # over the panel. It is a band, not a floor: below it means too few named
-    # steps, above it means too many single-use callables.
-    "granularity": {"human": 0.27, "human_sd": 0.13, "agent": None, "agent_sd": None},
+# Baseline bands by reference family. `python` is the SlopCodeBench / earendil.com
+# panel, and it is the only family with measured agent runs.
+#
+# `c` is this project's own panel of maintained C repositories, pinned in
+# REFERENCE.md: 11 repos, whole tree, each at or above the coverage gate. Its
+# `human` value is the panel median (the published Python values are the panel
+# mean, so the report says "x the reference" rather than "x the median"), its
+# `human_sd` is the panel spread, and its `agent` value is the worst maintained
+# repository measured. Crossing that line therefore means "worse than every
+# maintained C repo in the panel", not "as bad as an agent": there are no C
+# agent runs to measure. Granularity reads higher in C than in Python because C
+# keeps many single-caller static helpers, which is why the C band exists.
+_C_BANDS = {
+    "verbosity": {"human": 0.13, "human_sd": 0.11, "agent": 0.43, "agent_sd": None},
+    "erosion": {"human": 0.69, "human_sd": 0.22, "agent": 0.97, "agent_sd": None},
+    "granularity": {"human": 0.40, "human_sd": 0.09, "agent": None, "agent_sd": None},
 }
+BANDS = {
+    "python": {
+        "verbosity": {"human": 0.15, "human_sd": 0.06, "agent": 0.33, "agent_sd": 0.10},
+        "erosion": {"human": 0.31, "human_sd": 0.17, "agent": 0.68, "agent_sd": 0.20},
+        # Granularity has a human reference band but no agent band: SlopCodeBench
+        # never measured it, and our own agent sample is not comparable. Derived
+        # from the same human panel at HEAD (44 of 48 repos measurable), mean +/- sd
+        # over the panel. It is a band, not a floor: below it means too few named
+        # steps, above it means too many single-use callables.
+        "granularity": {"human": 0.27, "human_sd": 0.13, "agent": None, "agent_sd": None},
+    },
+    "c": _C_BANDS,
+}
+# What a repo gets when the C family does not apply: the panel the published
+# bands were measured on, which is also the only one with agent runs.
+REFERENCE_FAMILY = "python"
+REFERENCE_LABELS = {
+    "python": "SlopCodeBench human panel, Python (44 repos at HEAD)",
+    "c": "maintained C panel, whole tree (11 repos at 60%+ coverage; see REFERENCE.md)",
+}
+# The share of measured SLOC a single language family needs before its bands
+# apply. Below it the report keeps the Python bands and says so in one line.
+FAMILY_SHARE = 0.5
+FAMILY_LANGS = {"c": frozenset({"c", "cpp"})}
+# Directories whose contents do not vote on the band family: a test suite in
+# another language says nothing about what the source is written in.
+TEST_DIRS = frozenset({"t", "test", "tests", "testing", "spec", "specs"})
+
+
+def bands_for(family: str) -> dict:
+    """The band table for a family, falling back to the published one."""
+    return BANDS.get(family, BANDS[REFERENCE_FAMILY])
+
 SCB_CHECK_SUPPORTED = {"python", "javascript", "typescript", "rust", "zig", "haskell", "cpp", "c"}
 
 
@@ -1322,8 +1361,9 @@ def json_object(stdout: str) -> dict | None:
 # --------------------------------------------------------------------------
 
 
-def band(value: float, kind: str, higher_is_worse: bool = True) -> str:
-    b = BANDS[kind]
+def band(value: float, kind: str, family: str = REFERENCE_FAMILY,
+         higher_is_worse: bool = True) -> str:
+    b = bands_for(family)[kind]
     if higher_is_worse:
         if value <= b["human"]:
             return "at-or-below human baseline"
@@ -1333,15 +1373,15 @@ def band(value: float, kind: str, higher_is_worse: bool = True) -> str:
     return ""
 
 
-def ratio(value: float, kind: str) -> str:
-    b = BANDS[kind]
-    return f"{value / b['human']:.2f}x the human baseline" if b["human"] else ""
+def ratio(value: float, kind: str, family: str = REFERENCE_FAMILY) -> str:
+    b = bands_for(family)[kind]
+    return f"{value / b['human']:.2f}x the reference" if b["human"] else ""
 
 
-def granularity_band(value: float) -> str:
+def granularity_band(value: float, family: str = REFERENCE_FAMILY) -> str:
     """Granularity is a band, not a floor. Sitting below it is not an
     improvement: it means fewer named steps and more mass in one function."""
-    b = BANDS["granularity"]
+    b = bands_for(family)["granularity"]
     low = b["human"] - b["human_sd"]
     high = b["human"] + b["human_sd"]
     if value < low:
@@ -1702,14 +1742,63 @@ def unparsed(entry: FileEntry, reason: str) -> FileAnalysis:
     )
 
 
+def _clang_engine():
+    """Import the front-end module, as a package or as a uvx script.
+
+    The tool's main path runs `measure.py` as a file (`uvx ... python3 measure.py`),
+    where its directory is on sys.path and there is no package to be relative to.
+    """
+    try:
+        from . import clang_engine
+    except ImportError:
+        import clang_engine
+
+    return clang_engine
+
+
+def front_end_languages(files: list[FileEntry]) -> set[str]:
+    """Languages the clang front end will take, when it is installed.
+
+    C and C++ go through clang instead of a grammar because tree-sitter-c cannot
+    parse a preprocessed translation unit: issue #265 was closed as not planned,
+    PR #325 is unmerged, and computed goto has no report. So no grammar is asked
+    for these languages unless clang is missing, in which case the refusal path is
+    the same as before.
+    """
+    clang_engine = _clang_engine()
+    present = {entry.lang.name for entry in files}
+    if not present & clang_engine.ENGINE_LANGS or not clang_engine.available():
+        return set()
+    return present & set(clang_engine.ENGINE_LANGS)
+
+
 def analyze_files(
-    files: list[FileEntry], parsers: dict[str, object], named_only: bool
+    files: list[FileEntry], parsers: dict[str, object], named_only: bool,
+    root: Path | None = None,
 ) -> tuple[list[FileAnalysis], dict[str, int]]:
     """Analyze every file, falling back to SLOC when a parser is missing or fails."""
     results: list[FileAnalysis] = []
     failures: dict[str, int] = defaultdict(int)
-    for entry in files:
+    measured: dict[int, FileAnalysis] = {}
+    if root is not None:
+        clang_engine = _clang_engine()
+
+        front_end = [
+            index for index, entry in enumerate(files)
+            if entry.text.strip() and entry.lang.name in clang_engine.ENGINE_LANGS
+            and clang_engine.available()
+        ]
+        if front_end:
+            answers = clang_engine.analyze_many(
+                [files[index] for index in front_end], root, named_only
+            )
+            for index, answer in zip(front_end, answers):
+                measured[index] = answer
+    for index, entry in enumerate(files):
         if not entry.text.strip():
+            continue
+        if index in measured:
+            results.append(measured[index])
             continue
         parser = parsers.get(entry.lang.name)
         if parser is None:
@@ -1764,6 +1853,7 @@ class Run:
     scb: dict | None
     scb_error: str | None
     git: GitStats
+    front_end: dict = field(default_factory=dict)
 
     @property
     def total_sloc(self) -> int:
@@ -1798,6 +1888,42 @@ class Run:
         return sorted(broken, key=lambda r: -_fallback_sloc(r.entry.text))
 
     @property
+    def family(self) -> str:
+        """Which reference panel this repo is compared against.
+
+        A repo whose measured SLOC is mostly C or C++ is read against the C
+        panel. Everything else keeps the published Python bands, which the report
+        labels so a reader knows the comparison is loose. The number that decides
+        is measured SLOC rather than file count: one vendored C file next to a
+        hundred Python ones must not switch the bands.
+
+        Test files are left out of that judgement. A large suite in another
+        language is normal in a C project (git's `t/*.sh` out-measure its C by
+        SLOC, duktape's JS tests dwarf its source), and counting it would hand a C
+        repository the Python bands for no better reason than its tests.
+        """
+        per_lang: dict[str, int] = defaultdict(int)
+        for result in self.analyzed:
+            if result.parsed and not self.in_tests(result.entry.path):
+                per_lang[result.entry.lang.name] += result.sloc
+        total = sum(per_lang.values())
+        if not total:
+            return REFERENCE_FAMILY
+        for family, langs in FAMILY_LANGS.items():
+            share = sum(count for name, count in per_lang.items() if name in langs) / total
+            if share >= FAMILY_SHARE:
+                return family
+        return REFERENCE_FAMILY
+
+    def in_tests(self, path: Path) -> bool:
+        """True when a path sits under a test directory of the measured tree."""
+        try:
+            parts = path.resolve().relative_to(self.target.scope.resolve()).parts[:-1]
+        except (OSError, ValueError):
+            parts = path.parts[:-1]
+        return any(part.lower() in TEST_DIRS for part in parts)
+
+    @property
     def coverage(self) -> float:
         """The share of non-blank lines that reached the metrics.
 
@@ -1822,11 +1948,24 @@ def run_measurement(target: Target, args: argparse.Namespace) -> Run:
         include_bundled=args.include_minified,
     )
     present = {f.lang.name for f in files}
-    grammars = load_grammars(present)
+    front_end = front_end_languages(files)
+    # A language the front end takes needs no grammar: clang reads the preprocessed
+    # translation unit, which is exactly what tree-sitter-c cannot do.
+    grammars = load_grammars(present - front_end)
     parsers, tree_sitter_available = load_parsers(grammars)
-    results, failures = analyze_files(files, parsers, args.functions == "named")
+    results, failures = analyze_files(files, parsers, args.functions == "named", target.root)
     unreliable = unreliable_languages(results, parsers)
     analyzed = trustworthy_analyses(results, unreliable)
+    front_end_info = {
+        "languages": sorted(front_end),
+        "binary": clang_engine_binary(front_end),
+        "version": clang_engine_version(front_end),
+        "files": sum(1 for entry in files if entry.lang.name in front_end),
+        "measured": sum(
+            1 for result in results
+            if result.parsed and result.entry.lang.name in front_end
+        ),
+    }
     # The git root holds history for the whole repository, even when a subtree is
     # the scope, so growth and scb-check both run against it.
     scan_root = git_root(target.root) or target.root
@@ -1843,6 +1982,7 @@ def run_measurement(target: Target, args: argparse.Namespace) -> Run:
         grammars=grammars,
         parsers=parsers,
         tree_sitter=bool(grammars) and tree_sitter_available,
+        front_end=front_end_info,
         results=results,
         analyzed=analyzed,
         unreliable=unreliable,
@@ -1877,14 +2017,14 @@ def git_for(scan_root: Path, args: argparse.Namespace) -> GitStats:
     return git_stats(scan_root, args.since)
 
 
-def band_fields(value: float | None, kind: str) -> dict:
-    """The band a value lands in and its multiple of the human baseline.
+def band_fields(value: float | None, kind: str, family: str = REFERENCE_FAMILY) -> dict:
+    """The band a value lands in and its multiple of the reference value.
 
     One place pairs a value with its band, so a reading cannot carry a stale band.
     """
     return {
-        "band": band(value, kind) if value is not None else None,
-        "vs_human": ratio(value, kind) if value is not None else None,
+        "band": band(value, kind, family) if value is not None else None,
+        "vs_human": ratio(value, kind, family) if value is not None else None,
     }
 
 
@@ -1906,6 +2046,21 @@ def language_sloc(results: list[FileAnalysis]) -> dict[str, dict[str, int]]:
     return {name: dict(counts) for name, counts in sorted(by_lang.items())}
 
 
+def clang_engine_binary(front_end: set[str]) -> str:
+    """The clang binary this run used, or an empty string."""
+    if not front_end:
+        return ""
+    return _clang_engine().find_clang() or ""
+
+
+def clang_engine_version(front_end: set[str]) -> str:
+    """The clang version string, so a report says which front end produced it."""
+    binary = clang_engine_binary(front_end)
+    if not binary:
+        return ""
+    return _clang_engine().version(binary)
+
+
 def engine_payload(run: Run) -> dict:
     """What the engine saw: grammars, exclusions, and what it could not parse."""
     excluded = [
@@ -1915,8 +2070,11 @@ def engine_payload(run: Run) -> dict:
     return {
         "tree_sitter": run.tree_sitter,
         "grammars": sorted(run.grammars),
+        "front_end": run.front_end,
         "languages_present": sorted(run.present),
-        "languages_without_grammar": sorted(run.present - set(run.grammars)),
+        "languages_without_grammar": sorted(
+            run.present - set(run.grammars) - set(run.front_end.get("languages") or [])
+        ),
         "unreliable_languages": sorted(run.unreliable),
         "bundled_files": [f.rel for f in run.bundled],
         "anonymous_skipped": run.anonymous_skipped,
@@ -1962,7 +2120,7 @@ def verbosity_payload(run: Run) -> dict:
         "clone_lines": run.signals.clone_lines,
         "flagged_lines": run.signals.clone_lines,
         "ast_grep_lines": (run.scb or {}).get("ast_grep_flagged_loc"),
-        **band_fields(value, "verbosity"),
+        **band_fields(value, "verbosity", run.family),
     }
 
 
@@ -1976,7 +2134,7 @@ def erosion_payload(run: Run) -> dict:
         "total_mass": run.signals.total_mass,
         "high_cc_mass": run.signals.high_mass,
         "anonymous_skipped": run.anonymous_skipped,
-        **band_fields(value, "erosion"),
+        **band_fields(value, "erosion", run.family),
     }
 
 
@@ -1990,9 +2148,9 @@ def granularity_payload(run: Run) -> dict:
         "reused_functions": len(signals.reused_functions),
         "single_use_functions": len(signals.single_use_functions),
         "unused_functions": len(signals.unused_functions),
-        "band": granularity_band(value) if value is not None else None,
-        "human": BANDS["granularity"]["human"],
-        "human_sd": BANDS["granularity"]["human_sd"],
+        "band": granularity_band(value, run.family) if value is not None else None,
+        "human": bands_for(run.family)["granularity"]["human"],
+        "human_sd": bands_for(run.family)["granularity"]["human_sd"],
         "single_use_top": [
             func_entry(f, with_uses=True) for f in rank_by(signals.single_use_functions, run.args.top)
         ],
@@ -2048,10 +2206,22 @@ def git_payload(git: GitStats) -> dict:
     }
 
 
+def reference_payload(run: Run) -> dict:
+    """Which panel the bands below come from, and what its numbers are."""
+    family = run.family
+    return {
+        "family": family,
+        "label": REFERENCE_LABELS.get(family, family),
+        "metrics": bands_for(family),
+        "published": family != REFERENCE_FAMILY,
+    }
+
+
 def build_payload(run: Run) -> dict:
     """The JSON report: every number the text report prints, plus the lists behind them."""
     return {
         "root": str(run.target.scope),
+        "reference": reference_payload(run),
         "engine": engine_payload(run),
         "sloc": sloc_payload(run),
         "verbosity": verbosity_payload(run),
@@ -2093,7 +2263,8 @@ def exit_code(run: Run) -> int:
     if run.coverage < LOW_COVERAGE:
         return 3
     erosion = run.signals.erosion
-    return 1 if (erosion is not None and erosion > BANDS["erosion"]["agent"]) else 0
+    agent_line = bands_for(run.family)["erosion"]["agent"]
+    return 1 if (erosion is not None and erosion > agent_line) else 0
 
 
 def print_metric_row(label: str, value: float | None, band_name: str = "", detail: str = "",
@@ -2154,10 +2325,15 @@ def print_coverage(p: dict) -> None:
 
 def print_engine_notes(engine: dict) -> None:
     """Everything a reader has to know before trusting a number below."""
-    if not engine["tree_sitter"]:
+    front = engine.get("front_end") or {}
+    if not engine["tree_sitter"] and not front.get("measured"):
         print("\n  NOTE: Tree-sitter is unavailable, so no metric below was measured.")
         print("        Run through `sloptrack measure`, or the skill's run.sh, which")
         print("        supply the grammars in a throwaway uvx environment.")
+    if front.get("languages"):
+        langs = " and ".join(front["languages"])
+        print(f"  {langs} measured with {front.get('version') or front.get('binary')}"
+              f"  ({front.get('measured', 0)} of {front.get('files', 0)} file(s))")
     if engine["bundled_files"]:
         shown = ", ".join(engine["bundled_files"][:3])
         extra = len(engine["bundled_files"]) - 3
@@ -2196,7 +2372,7 @@ def print_verbosity(p: dict) -> None:
         return
     print_metric_detail(
         f"clone lines {v['clone_lines']} of {p['sloc']['measured']} SLOC"
-        "   [human 0.15 +/- 0.06 | agent 0.33 +/- 0.10]"
+        f"   [{band_detail(p['reference'], 'verbosity')}]"
     )
     if v.get("ast_grep_lines") is None:
         print("              clone component only. The published metric also counts")
@@ -2210,7 +2386,7 @@ def print_erosion(p: dict) -> None:
         return
     print_metric_detail(
         f"{e['high_cc_functions']} of {e['functions']} functions have CC > {HIGH_CC}"
-        "   [human 0.31 +/- 0.17 | agent 0.68 +/- 0.20]"
+        f"   [{band_detail(p['reference'], 'erosion')}]"
     )
     if e.get("anonymous_skipped"):
         print_metric_detail(
@@ -2239,8 +2415,21 @@ def print_granularity(p: dict) -> None:
         )
 
 
+def band_detail(reference: dict, kind: str) -> str:
+    """The band's own numbers, in the line under each metric."""
+    metric = reference["metrics"][kind]
+    human = f"human {metric['human']:.2f} +/- {metric['human_sd']:.2f}"
+    agent = metric.get("agent")
+    if agent is None:
+        return f"reference {human}"
+    return f"human {metric['human']:.2f} +/- {metric['human_sd']:.2f} | agent {agent:.2f} +/- {metric['agent_sd']:.2f}"
+
+
 def print_metrics(p: dict) -> None:
     """The three metrics, in the order the bands are documented."""
+    reference = p["reference"]
+    print()
+    print(f"  bands        {reference['label']}")
     print_verbosity(p)
     print_erosion(p)
     print_granularity(p)

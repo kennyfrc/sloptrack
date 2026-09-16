@@ -682,7 +682,7 @@ def test_compute_signals_reads_a_verbosity_of_none_when_nothing_was_parsed():
 
 def test_band_fields_pair_a_value_with_its_band():
     assert measure.band_fields(0.10, "verbosity") == {
-        "band": "at-or-below human baseline", "vs_human": "0.67x the human baseline",
+        "band": "at-or-below human baseline", "vs_human": "0.67x the reference",
     }
     assert measure.band_fields(None, "erosion") == {"band": None, "vs_human": None}
 
@@ -707,6 +707,33 @@ def test_scb_for_is_absent_unless_asked(repo: Path):
     args = measure.build_parser().parse_args([str(repo)])
 
     assert measure.scb_for(repo, args) == (None, None)
+
+
+def test_the_family_ignores_tests_when_they_are_another_language(tmp_path: Path):
+    """git's shell suite out-measures its C; that must not pick the bands.
+
+    Test files are left out of the vote, so a C repo with a large suite in
+    another language is still read against the C panel.
+    """
+    base = dict(args=measure.build_parser().parse_args([str(tmp_path), "--no-git"]),
+                target=measure.Target(scope=tmp_path, root=tmp_path), scan_root=tmp_path,
+                files=[], bundled=[], long_lines=[], present={"c", "bash"},
+                grammars={}, parsers={}, tree_sitter=True, unreliable=set(),
+                failures={}, scb=None, scb_error=None,
+                git=measure.GitStats(skip_reason="--no-git"),
+                signals=measure.Signals(
+                    verbosity=0.0, measured_sloc=0, clone_lines=0, groups={},
+                    functions=[], used_functions=[], reused_functions=[],
+                    single_use_functions=[], unused_functions=[], granularity=0.0,
+                    total_mass=0.0, high_mass=0.0, erosion=0.0, high_cc=[],
+                ))
+    source = analysis("src/parse.c", sloc=100)
+    suite = analysis("t/parse.sh", sloc=400)
+    base["results"] = [source, suite]
+    base["analyzed"] = [source, suite]
+    run = measure.Run(**base)
+
+    assert run.family == "c"
 
 
 def test_scb_for_runs_the_reference_implementation_when_asked(repo: Path, monkeypatch):
@@ -889,7 +916,7 @@ def test_build_payload_has_every_section(tmp_path: Path):
     payload = measure.build_payload(synthetic_run(tmp_path))
 
     assert set(payload) == {
-        "root", "engine", "sloc", "verbosity", "erosion", "granularity",
+        "root", "reference", "engine", "sloc", "verbosity", "erosion", "granularity",
         "git", "hotspots", "duplicate_blocks", "scb_check",
     }
     assert payload["root"] == str(tmp_path)

@@ -23,6 +23,7 @@ SKILL_NAME = "measure-then-fix-slop"
 # The installed names are the documented ones: run.sh calls slop_measure.py.
 PACKAGE_FILES = {
     "measure.py": "slop_measure.py",
+    "clang_engine.py": "clang_engine.py",
     "check_languages.py": "check_languages.py",
 }
 DEFAULT_SKILLS_DIR = "~/.agents/skills"
