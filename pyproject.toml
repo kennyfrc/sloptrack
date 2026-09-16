@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sloptrack"
+description = "Measure the slop in a codebase: verbosity, erosion, and granularity"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Kenn Costales" }]
+keywords = [
+  "code-quality",
+  "slop",
+  "cyclomatic-complexity",
+  "clone-detection",
+  "tree-sitter",
+  "agent-skills",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "build"]
+
+[project.urls]
+Homepage = "https://github.com/kennyfrc/sloptrack"
+Repository = "https://github.com/kennyfrc/sloptrack"
+Issues = "https://github.com/kennyfrc/sloptrack/issues"
+
+[project.scripts]
+sloptrack = "sloptrack.cli:main"
+
+[tool.hatch.version]
+path = "src/sloptrack/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sloptrack"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "README.md", "LICENSE", "install.sh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,3 +1,15 @@
 __pycache__/
 *.pyc
 .slop/
+
+# build output
+dist/
+build/
+*.egg-info/
+.venv/
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
