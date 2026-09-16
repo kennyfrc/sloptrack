@@ -36,11 +36,9 @@ fi
 
 # The checker owns the language table, so it also answers which packages supply
 # the grammars. It reads the table only, so this works before anything is installed.
+# An empty list is left to the checker, which names the language that has no
+# grammar or no fixture instead of blaming the package list.
 pkgs="$(python3 "$CHECK" --print-requirements "$@")"
-if [ -z "$pkgs" ]; then
-  echo "error: no grammar packages reported for this request" >&2
-  exit 2
-fi
 
 with_args=()
 for pkg in $pkgs; do
