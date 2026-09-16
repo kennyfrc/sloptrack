@@ -679,6 +679,46 @@ def test_band_fields_pair_a_value_with_its_band():
 # ---------------------------------------------------------------------------
 
 
+def test_trustworthy_analyses_drops_unparsed_and_unreliable():
+    """An unparsed or untrustworthy language must not reach the denominator."""
+    good = analysis(functions=[func("alpha")])
+    unparsed = analysis(functions=[func("beta")], parsed=False)
+    foreign = analysis("app.rb", functions=[func("gamma", rel="app.rb")])
+
+    kept = measure.trustworthy_analyses([good, unparsed, foreign], {"ruby"})
+
+    assert kept == [good]
+
+
+def test_scb_for_is_absent_unless_asked(repo: Path):
+    args = measure.build_parser().parse_args([str(repo)])
+
+    assert measure.scb_for(repo, args) == (None, None)
+
+
+def test_scb_for_runs_the_reference_implementation_when_asked(repo: Path, monkeypatch):
+    args = measure.build_parser().parse_args([str(repo), "--scb"])
+    seen: list[Path] = []
+
+    def fake(root, timeout=900):
+        seen.append(root)
+        return {"erosion": 0.1, "verbosity": 0.2}, None
+
+    monkeypatch.setattr(measure, "run_scb_check", fake)
+
+    assert measure.scb_for(repo, args) == ({"erosion": 0.1, "verbosity": 0.2}, None)
+    assert seen == [repo]
+
+
+def test_git_for_names_the_reason_it_was_skipped(repo: Path):
+    skipped = measure.git_for(repo, measure.build_parser().parse_args([str(repo), "--no-git"]))
+
+    assert skipped.skip_reason == "--no-git"
+
+    measured = measure.git_for(repo, measure.build_parser().parse_args([str(repo)]))
+    assert measured.available
+
+
 def test_run_measurement_records_the_scan(repo: Path):
     run = run_for(repo)
 

@@ -1746,14 +1746,12 @@ def run_measurement(target: Target, args: argparse.Namespace) -> Run:
     parsers, tree_sitter_available = load_parsers(grammars)
     results, failures = analyze_files(files, parsers, args.functions == "named")
     unreliable = unreliable_languages(results, parsers)
-    # Only parsed, trustworthy files may enter the metrics. An unparsed language
-    # would otherwise dilute the denominator and fake a low verbosity.
-    analyzed = [r for r in results if r.parsed and r.entry.lang.name not in unreliable]
+    analyzed = trustworthy_analyses(results, unreliable)
     # The git root holds history for the whole repository, even when a subtree is
     # the scope, so growth and scb-check both run against it.
     scan_root = git_root(target.root) or target.root
-    scb, scb_error = run_scb_check(scan_root) if args.scb else (None, None)
-    git = GitStats(skip_reason="--no-git") if args.no_git else git_stats(scan_root, args.since)
+    scb, scb_error = scb_for(scan_root, args)
+    git = git_for(scan_root, args)
     return Run(
         args=args,
         target=target,
@@ -1774,6 +1772,29 @@ def run_measurement(target: Target, args: argparse.Namespace) -> Run:
         scb_error=scb_error,
         git=git,
     )
+
+
+def trustworthy_analyses(results: list[FileAnalysis], unreliable: set[str]) -> list[FileAnalysis]:
+    """The analyses the metrics may use.
+
+    An unparsed language would dilute the denominator and fake a low verbosity, so
+    it is dropped rather than reported as a confident zero.
+    """
+    return [r for r in results if r.parsed and r.entry.lang.name not in unreliable]
+
+
+def scb_for(scan_root: Path, args: argparse.Namespace) -> tuple[dict | None, str | None]:
+    """The reference implementation's composites, and why they are absent."""
+    if not args.scb:
+        return None, None
+    return run_scb_check(scan_root)
+
+
+def git_for(scan_root: Path, args: argparse.Namespace) -> GitStats:
+    """Line growth over the window, or the reason it was not measured."""
+    if args.no_git:
+        return GitStats(skip_reason="--no-git")
+    return git_stats(scan_root, args.since)
 
 
 def band_fields(value: float | None, kind: str) -> dict:
