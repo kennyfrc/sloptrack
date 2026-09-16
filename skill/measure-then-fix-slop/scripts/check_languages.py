@@ -18,6 +18,10 @@ What this checks per language:
   literals   the same clone group survives after one copy's numbers change,
              proving the `literals` vocabulary normalizes constants
   name       no function is named with a raw text blob (a fallback `_func_name`)
+  calls      a base fixture calls none of its functions, so no declared name may
+             have a counted call; and an appended two-call fixture counts the
+             called function twice and the other once, proving the granularity
+             call vocabulary detects `foo()` in that language
 
 It does not check numbers against scb-check, and it does not prove the metric
 is right. It catches vocabulary drift: node names that moved, a grammar that
@@ -569,6 +573,38 @@ SAMPLES: dict[str, tuple[str, str, int, int]] = {
 }
 
 
+# Positively verify reference counting for the granularity metric. Each entry
+# appends two calls to `alpha` and `beta` to that language's fixture (alpha
+# once, beta twice), then checks the counts. A language absent here still gets
+# the declaration-exclusion check, which runs on every fixture.
+#
+# alpha uses == 1 also proves the declaration name was excluded: if it counted,
+# the value would be 2. beta uses >= 2 proves a real reference is counted.
+USE_CALLS: dict[str, str] = {
+    "python": "\nalpha([])\nbeta([])\nbeta([])\n",
+    "javascript": "\nalpha([]);\nbeta([]);\nbeta([]);\n",
+    "typescript": "\nalpha([]);\nbeta([]);\nbeta([]);\n",
+    "ruby": "\nalpha([])\nbeta([])\nbeta([])\n",
+    "go": "\nvar _ = []int{alpha(nil), beta(nil), beta(nil)}\n",
+    "rust": "\nfn uses() { alpha(&[]); beta(&[]); beta(&[]); }\n",
+    "java": "\nclass Uses { static void run() { Sample.alpha(new int[0]); Sample.beta(new int[0]); Sample.beta(new int[0]); } }\n",
+    "c": "\nint uses(void) { alpha(0, 0); beta(0, 0); beta(0, 0); return 0; }\n",
+    "cpp": "\nint uses() { alpha(nullptr, 0); beta(nullptr, 0); beta(nullptr, 0); return 0; }\n",
+    "csharp": "\nclass Uses { static void Run() { Sample.Alpha(new int[0]); Sample.Beta(new int[0]); Sample.Beta(new int[0]); } }\n",
+    "php": "\nalpha([]);\nbeta([]);\nbeta([]);\n",
+    "kotlin": "\nval useA = alpha(listOf(1))\nval useB = beta(listOf(1))\nval useB2 = beta(listOf(2))\n",
+    "swift": "\n_ = alpha([0])\n_ = beta([0])\n_ = beta([0])\n",
+    "scala": "\nval useA = alpha(Nil)\nval useB = beta(Nil)\nval useB2 = beta(Nil)\n",
+    "lua": "\nalpha({})\nbeta({})\nbeta({})\n",
+    "haskell": "\nuseA = alpha []\nuseB = beta []\nuseB2 = beta []\n",
+    "zig": "\nconst useA = alpha(&[_]i32{});\nconst useB = beta(&[_]i32{});\nconst useB2 = beta(&[_]i32{});\n",
+    "bash": "\nalpha\nbeta\nbeta\n",
+}
+
+# Languages whose fixture names its functions Alpha/Beta rather than alpha/beta.
+USE_CALL_NAMES: dict[str, tuple[str, str]] = {"csharp": ("Alpha", "Beta")}
+
+
 # A clone group this long can only be the function body itself, not a nested
 # block. Requiring it proves function-level clones fire, not just sub-blocks.
 MIN_FUNCTION_CLONE_SPAN = 6
@@ -651,6 +687,15 @@ def check_language(
     worst = max((f.cc for f in functions), default=0)
     clones = clone_group_count(analysis)
     largest = largest_clone_span(analysis)
+    # The base fixture calls none of its functions, so no declared name may have
+    # a counted call. A nonzero value means a declaration or a shadow was read as
+    # a use.
+    declared_names = {f.name for f in functions}
+    miscounted = {
+        call_name: analysis.references.get(call_name, 0)
+        for call_name in declared_names
+        if analysis.references.get(call_name, 0)
+    }
 
     # A second pass with the first copy's numbers changed. The two bodies now
     # differ only in literal values, so a matching function-level group proves
@@ -697,10 +742,30 @@ def check_language(
     )
     if bad_name is not None:
         reasons.append(f"function name looks like a text blob: {bad_name.name[:40]!r}")
+    if miscounted:
+        reasons.append(f"declaration name(s) counted as calls: {miscounted}")
+
+    use_note = ""
+    calls = USE_CALLS.get(name)
+    if calls:
+        alpha_name, beta_name = USE_CALL_NAMES.get(name, ("alpha", "beta"))
+        use_entry = m.FileEntry(path=Path(filename), rel=filename, lang=cfg, text=source + calls)
+        try:
+            use_analysis = m.analyze_file(use_entry, parser, named_only=True)
+            refs = use_analysis.references
+            alpha_uses = refs.get(alpha_name, 0)
+            beta_uses = refs.get(beta_name, 0)
+            use_note = f"  uses {alpha_name} {alpha_uses}/{beta_name} {beta_uses}"
+            if alpha_uses != 1:
+                reasons.append(f"call counting: expected {alpha_name} called once, got {alpha_uses}")
+            if beta_uses < 2:
+                reasons.append(f"call counting: expected {beta_name} called twice or more, got {beta_uses}")
+        except Exception as exc:  # noqa: BLE001
+            reasons.append(f"use fixture raised {type(exc).__name__}: {exc}")
 
     detail = (
         f"functions {len(functions)}  max CC {worst}  clones {clones}"
-        f"  span {largest}  lit-span {mutated_span}  sloc {analysis.sloc}"
+        f"  span {largest}  lit-span {mutated_span}  sloc {analysis.sloc}{use_note}"
     )
     if reasons:
         return False, detail + "  |  " + "; ".join(reasons), analysis
@@ -762,7 +827,7 @@ def main() -> int:
         return 2
     if failures:
         return 1
-    print("  every table entry yields functions, complexity, and clones on its fixture")
+    print("  every table entry yields functions, complexity, clones, and call counts on its fixture")
     return 0
 
 
