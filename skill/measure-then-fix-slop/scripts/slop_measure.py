@@ -3,9 +3,13 @@
 
 Reports the SlopCodeBench quality signals:
 
-    verbosity = |clone lines U ast-grep lines| / SLOC
-    erosion   = sum(mass(f) for CC(f) > 10) / sum(mass(f))
-    mass(f)   = CC(f) * sqrt(SLOC(f))
+    verbosity   = |clone lines U ast-grep lines| / SLOC
+    erosion     = sum(mass(f) for CC(f) > 10) / sum(mass(f))
+    mass(f)     = CC(f) * sqrt(SLOC(f))
+    granularity = single-use callables / callables with a call site
+
+Granularity is a band, not a floor: too high means over-decomposition, too low
+means too few named steps. It has a human band but no agent band.
 
 Verbosity and erosion are computed from a Tree-sitter parse when the grammar
 for the repo's language is importable. Without Tree-sitter the tool still
@@ -44,6 +48,12 @@ DUPLICATE_LOCATIONS = 4  # a normalized clone must span at least this many SLOC
 BANDS = {
     "verbosity": {"human": 0.15, "human_sd": 0.06, "agent": 0.33, "agent_sd": 0.10},
     "erosion": {"human": 0.31, "human_sd": 0.17, "agent": 0.68, "agent_sd": 0.20},
+    # Granularity has a human reference band but no agent band: SlopCodeBench
+    # never measured it, and our own agent sample is not comparable. Derived
+    # from the same human panel at HEAD (44 of 48 repos measurable), mean +/- sd
+    # over the panel. It is a band, not a floor: below it means too few named
+    # steps, above it means too many single-use callables.
+    "granularity": {"human": 0.27, "human_sd": 0.13, "agent": None, "agent_sd": None},
 }
 SCB_CHECK_SUPPORTED = {"python", "javascript", "typescript", "rust", "zig", "haskell", "cpp", "c"}
 
@@ -71,6 +81,10 @@ class Lang:
     # the historical behavior. scb-check names this field `clone_node_types`;
     # declare it when that merge would enroll a node that is not a clone unit.
     clone_types: frozenset[str] = frozenset()
+    # Node types that name an invocation, for the granularity use count. Empty
+    # means DEFAULT_CALLS. Declare it when a grammar reuses a call-shaped node
+    # for something that is not an invocation.
+    calls: frozenset[str] = frozenset()
     binary_like: frozenset[str] = frozenset()
     bool_tokens: frozenset[str] = frozenset({"&&", "||", "and", "or"})
     comments: frozenset[str] = frozenset({"comment"})
@@ -632,11 +646,14 @@ class FileAnalysis:
     clone_candidates: list[tuple[str, int, int]] = field(default_factory=list)
     parsed: bool = False
     anonymous: int = 0
+    # Call-site counts by callee name. The cross-file sum is the use count for
+    # the granularity metric.
+    references: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
 class Func:
-    """One function with its complexity mass."""
+    """One function with its complexity mass and cross-file use count."""
 
     name: str
     file: str
@@ -644,6 +661,7 @@ class Func:
     line: int
     cc: int
     sloc: int
+    uses: int = 0
 
     @property
     def mass(self) -> float:
@@ -682,6 +700,8 @@ def analyze_file(entry: FileEntry, parser, named_only: bool = True) -> FileAnaly
 
     functions: list[Func] = []
     anonymous = 0
+    declared_ids: set[int] = set()
+    self_spans: list[tuple[str, int, int]] = []
     for node in named_walk(root):
         if node.type not in cfg.functions:
             continue
@@ -690,7 +710,11 @@ def analyze_file(entry: FileEntry, parser, named_only: bool = True) -> FileAnaly
             continue
         if node.child_by_field_name("body") is None and node.child_count == 0:
             continue  # declaration without a body (interface, signature, prototype)
+        declared = _func_name_node(node, cfg)
+        if declared is not None:
+            declared_ids.add(declared.id)
         name, is_named = _func_name(node, cfg)
+        self_spans.append((name, node.start_byte, node.end_byte))
         if not is_named:
             anonymous += 1
             if named_only:
@@ -713,10 +737,11 @@ def analyze_file(entry: FileEntry, parser, named_only: bool = True) -> FileAnaly
         )
 
     candidates = _clone_candidates(root, cfg)
+    references = _call_references(root, cfg, declared_ids, self_spans)
     return FileAnalysis(
         entry=entry, sloc=sloc_lines, comment_rows=comment_rows,
         functions=functions, clone_candidates=candidates, parsed=True,
-        anonymous=anonymous,
+        anonymous=anonymous, references=references,
     )
 
 
@@ -806,13 +831,11 @@ def _assigned_name(node, cfg: Lang) -> str:
     return ""
 
 
-def _func_name(node, cfg: Lang) -> tuple[str, bool]:
-    """Return (display name, is named).
+def _func_name_node(node, cfg: Lang):
+    """The node that spells a callable's declared name, or None.
 
-    A callable counts toward the metrics only when it can be named: either from
-    its own declaration, or from the variable it is assigned to. This matches the
-    reference implementation, which drops anonymous callbacks from both the
-    numerator and the denominator. `--functions all` keeps them instead.
+    Mirrors the field lookup in `_func_name` so the granularity counter can
+    exclude exactly the node it treats as a declaration.
     """
     for field_name in ("name", "declarator", "pattern"):
         child = node.child_by_field_name(field_name)
@@ -826,9 +849,22 @@ def _func_name(node, cfg: Lang) -> tuple[str, bool]:
             if inner is None or inner.id == child.id:
                 break
             child = inner
-        text = _clean_text(child)
-        if text:
-            return text, True
+        if _clean_text(child):
+            return child
+    return None
+
+
+def _func_name(node, cfg: Lang) -> tuple[str, bool]:
+    """Return (display name, is named).
+
+    A callable counts toward the metrics only when it can be named: either from
+    its own declaration, or from the variable it is assigned to. This matches the
+    reference implementation, which drops anonymous callbacks from both the
+    numerator and the denominator. `--functions all` keeps them instead.
+    """
+    declared = _func_name_node(node, cfg)
+    if declared is not None:
+        return _clean_text(declared), True
 
     assigned = _assigned_name(node, cfg)
     if assigned:
@@ -836,6 +872,82 @@ def _func_name(node, cfg: Lang) -> tuple[str, bool]:
 
     head = _clean_text(node) or node.type
     return head, False
+
+
+# A use is a call site. Node types that name an invocation, and the fields that
+# hold the callee. A language whose grammar differs can override `Lang.calls`.
+DEFAULT_CALLS = frozenset(
+    {
+        "call", "call_expression", "function_call", "method_invocation",
+        "invocation_expression", "function_call_expression", "member_call_expression",
+        "scoped_call_expression", "macro_invocation", "apply", "command",
+    }
+)
+DEFAULT_CALLEE_FIELDS = ("function", "name", "method", "callee", "macro", "command_name", "constructor")
+ARGUMENT_CONTAINERS = frozenset(
+    {"arguments", "argument_list", "argument", "token_tree", "call_arguments", "type_arguments"}
+)
+
+
+def _callee_subtree(node):
+    """The subtree that names what a call invokes, or None."""
+    for field_name in DEFAULT_CALLEE_FIELDS:
+        child = node.child_by_field_name(field_name)
+        if child is not None:
+            return child
+    for child in node.named_children:
+        if child.type not in ARGUMENT_CONTAINERS:
+            return child
+    return None
+
+
+def _last_identifier(node, cfg: Lang):
+    """The rightmost identifier in a subtree. For `obj.method` this is the
+    method, which is the invoked name, not the receiver."""
+    found = None
+    for current in named_walk(node):
+        if current.type in cfg.identifiers:
+            found = current
+    return found
+
+
+def _is_self_reference(node, text: str, self_spans: list[tuple[str, int, int]]) -> bool:
+    """True when the call sits inside a callable with the same name, so it is
+    recursion rather than reuse of a helper."""
+    start = node.start_byte
+    return any(name == text and begin <= start < end for name, begin, end in self_spans)
+
+
+def _call_references(
+    root,
+    cfg: Lang,
+    declared_ids: set[int],
+    self_spans: list[tuple[str, int, int]],
+) -> dict[str, int]:
+    """Count uses by name, where a use is a call site.
+
+    Only a call or method call counts: `foo()` and `obj.foo()`. A name that is
+    merely mentioned (a callback passed by name, a local variable that shares the
+    name) is not a use. Recursion is not a use either. This is still name-based,
+    so two callables that share a name share their count, but it does not let a
+    shadowing local invent calls.
+    """
+    call_types = cfg.calls or DEFAULT_CALLS
+    counts: dict[str, int] = defaultdict(int)
+    for node in named_walk(root):
+        if node.type not in call_types:
+            continue
+        callee = _callee_subtree(node)
+        if callee is None:
+            continue
+        identifier = _last_identifier(callee, cfg)
+        if identifier is None or identifier.id in declared_ids:
+            continue
+        text = _clean_text(identifier)
+        if not text or _is_self_reference(identifier, text, self_spans):
+            continue
+        counts[text] += 1
+    return dict(counts)
 
 
 def _decision_count(node, cfg: Lang, fold_nested: bool = False) -> int:
@@ -1084,6 +1196,19 @@ def ratio(value: float, kind: str) -> str:
     return f"{value / b['human']:.2f}x the human baseline" if b["human"] else ""
 
 
+def granularity_band(value: float) -> str:
+    """Granularity is a band, not a floor. Sitting below it is not an
+    improvement: it means fewer named steps and more mass in one function."""
+    b = BANDS["granularity"]
+    low = b["human"] - b["human_sd"]
+    high = b["human"] + b["human_sd"]
+    if value < low:
+        return "below human band"
+    if value > high:
+        return "above human band"
+    return "within human band"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Measure code slop (verbosity and structural erosion).")
     ap.add_argument("path", nargs="?", default=".", help="repository or directory to measure")
@@ -1239,6 +1364,24 @@ def main() -> int:
     functions = [f for r in analyzed for f in r.functions]
     anonymous_skipped = sum(r.anonymous for r in analyzed)
 
+    # Granularity: a named callable invoked once is premature reuse (Muratori,
+    # "Semantic Compression"). References are summed across the corpus by name,
+    # so same-name definitions share a count. Zero-use callables are excluded
+    # from the ratio and listed separately: they are entry points, exports, or
+    # dead code, and the metric cannot tell which.
+    references: dict[str, int] = defaultdict(int)
+    for r in analyzed:
+        for ref_name, count in r.references.items():
+            references[ref_name] += count
+    for f in functions:
+        f.uses = references.get(f.name, 0)
+
+    used_functions = [f for f in functions if f.uses >= 1]
+    reused_functions = [f for f in used_functions if f.uses >= 2]
+    single_use_functions = [f for f in used_functions if f.uses == 1]
+    unused_functions = [f for f in functions if f.uses == 0]
+    granularity = (len(single_use_functions) / len(used_functions)) if used_functions else None
+
     total_mass = sum(f.mass for f in functions)
     high_mass = sum(f.mass for f in functions if f.cc > HIGH_CC)
     erosion = high_mass / total_mass if total_mass else None
@@ -1325,6 +1468,21 @@ def main() -> int:
             "anonymous_skipped": anonymous_skipped,
             "band": band(erosion, "erosion") if erosion is not None else None,
             "vs_human": ratio(erosion, "erosion") if erosion is not None else None,
+        },
+        "granularity": {
+            "value": granularity,
+            "used_functions": len(used_functions),
+            "reused_functions": len(reused_functions),
+            "single_use_functions": len(single_use_functions),
+            "unused_functions": len(unused_functions),
+            "band": granularity_band(granularity) if granularity is not None else None,
+            "human": BANDS["granularity"]["human"],
+            "human_sd": BANDS["granularity"]["human_sd"],
+            "single_use_top": [
+                {"file": f.file, "line": f.line, "name": f.name, "uses": f.uses,
+                 "cc": f.cc, "sloc": f.sloc}
+                for f in sorted(single_use_functions, key=lambda f: (f.sloc, f.cc), reverse=True)[: args.top]
+            ],
         },
         "git": {
             "available": git.available,
@@ -1434,6 +1592,18 @@ def print_report(p: dict) -> None:
     else:
         print("  EROSION     n/a (no functions parsed)")
 
+    gr = p["granularity"]
+    if gr["value"] is not None:
+        print(f"  GRANULARITY {gr['value']:.3f}   {gr['band']}"
+              f"   (human {gr['human']:.2f} +/- {gr['human_sd']:.2f})")
+        print(f"              {gr['single_use_functions']} of {gr['used_functions']} used callables invoked"
+              f" once; {gr['reused_functions']} invoked twice or more")
+        if gr["unused_functions"]:
+            print(f"              {gr['unused_functions']} callable(s) have no call site"
+                  " (entry points, public API, or dead code)")
+    else:
+        print("  GRANULARITY n/a (no callable has a counted reference)")
+
     g = p["git"]
     print()
     if g["available"]:
@@ -1486,6 +1656,12 @@ def print_report(p: dict) -> None:
             more = b["occurrences"] - len(b["locations"])
             more = f" (+{more} more)" if more > 0 else ""
             print(f"    {b['lines']:>4} lines x{b['occurrences']}, saves {b['recoverable_lines']:>4}  {shown}{more}")
+
+    if p["granularity"]["single_use_top"]:
+        print("\n  SINGLE-USE CALLABLES (invoked once; inline it unless it names a step)")
+        for f in p["granularity"]["single_use_top"]:
+            print(f"    {f['sloc']:>5} sloc  CC {f['cc']:<3}  {f['file']}:{f['line']}  {f['name']}"
+                  f"  (uses {f['uses']})")
 
 
 if __name__ == "__main__":
