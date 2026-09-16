@@ -143,6 +143,38 @@ baseline is a reason to stop working, not a score to defend.
 Granularity is the exception. Its row is a band in both directions: below it is
 not an improvement. Read it as "inside the human range", not "under the line".
 
+## Measured reference numbers
+
+Seven open-source repos measured whole-tree, to check that the bands behave on
+code nobody wrote for a benchmark. Coverage is the share of non-blank lines that
+reached the metrics.
+
+| Repo | Language | Coverage | Verbosity | Erosion | Granularity |
+|---|---|---|---|---|---|
+| flask | Python | 80/80 | 0.017 | 0.234 | 0.254 |
+| requests | Python | 36/36 | 0.006 | 0.234 | 0.269 |
+| click | Python | 85/85 | 0.013 | 0.278 | 0.252 |
+| TinyGL | C | 36/51 | 0.120 | 0.471 | 0.663 |
+| nginx | C | 298/413 | refused | refused | refused |
+| tinyemu | C | 66/91 | refused | refused | refused |
+| quickjs, mquickjs, libbf, tcc | C, JS | 11-20% | refused | refused | refused |
+
+The three Python repos land inside the human band on all three signals, and
+their granularity (0.25-0.27) sits on the panel mean. Use them as the check that
+a scope is being read the same way the bands were.
+
+TinyGL is the only C project that clears the coverage gate. Its verbosity sits
+below the human baseline, its erosion sits between the human and agent bands,
+and its granularity is far above the human band. Read that last number with
+care: C keeps many small `static` helpers with a single caller by design, and
+the band came from a Python panel. A high granularity reading in C or C++ is a
+fact about the language before it is a fact about the code.
+
+The refused C projects fail for one reason. tree-sitter-c cannot represent
+`#if` inside an initializer or a declaration. In every one of them, the largest
+hand-written files are the skipped ones, so the surviving subset would flatter
+the repo. That is what exit 3 is for.
+
 ## What the benchmark found
 
 From 20 problems, 93 checkpoints, and 11 models:
@@ -287,8 +319,15 @@ the reference CLI with the per-language configs is
   tool warns instead of excluding, because guessing wrong here silently removes
   real source. Decide by looking at the file, then `--exclude` it if it is not
   yours.
-- `total SLOC` shows a measured/excluded split when the repo mixes languages
-  the analyzer can and cannot parse. The excluded part is not in either metric.
+- `SLOC X measured of Y non-blank lines` splits when the repo mixes languages
+  the analyzer can and cannot parse. The skipped part is not in either metric.
+  The units differ on purpose: a parsed file reports SLOC, which excludes its
+  comments and punctuation-only lines, and an unparsed one can only report
+  non-blank lines, because nothing found its comments.
+- `COVERAGE` is the gate on everything below it: the share of non-blank lines
+  that reached the metrics. Below 60% the run exits 3 and the section names the
+  heaviest files it could not parse. Check whether they are the files the change
+  touches before reading any number.
 - The `--scb` coverage line matters. `scb-check` silently skips files whose
   language it does not support and still prints a score. On a Ruby repo it
   measures whatever JavaScript and Python it finds and reports that as the
@@ -460,6 +499,22 @@ phase runs on pairs: a number, and a check that the code underneath it is
 genuinely easier to change.
 
 ## Limits
+
+- **A file that does not parse is not measured.** The grammar is the only source
+  of structure, so a file whose parse contains an error is skipped whole, and
+  the `COVERAGE` line says how much of the repo survived. Under 60% of non-blank
+  lines the tool exits 3 rather than grade a sliver. Skipping whole files is
+  deliberate. Tree-sitter recovery is not local, so a partly-broken file can
+  still yield a bogus span that swallows a valid function. One attempt at
+  measuring quickjs in pieces reported `JS_CallInternal` at 3,574 SLOC and
+  CC 462, where the real function is a fraction of that. C triggers this with
+  `#if` inside initializers and declarations. nginx, quickjs, mquickjs, tcc,
+  tinyemu, and libbf all read as unmeasurable for that reason. TinyGL is the one
+  C project measured here that clears the gate.
+- **The bands come from a Python panel.** The panel behind verbosity and erosion is 48
+  maintained Python repositories. A language with different idioms can sit
+  outside its range without being worse. C is the known case, where
+  single-use `static` helpers are normal.
 
 - **Static only.** No tests, no runtime behavior, no correctness. Code can
   score well here and still be broken.

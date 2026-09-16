@@ -72,8 +72,10 @@ Adding or fixing a language means one `LANGS` entry plus one fixture. Follow
 "Adding a language" in `REFERENCE.md`, then run the checker before trusting the
 new entry.
 
-Exit codes: `0` normal, `1` erosion above the agent band, `2` bad input. Do not
-treat exit 1 as a failure of the tool.
+Exit codes: `0` normal, `1` erosion above the agent band, `2` bad input, `3` too
+little of the repo parsed to judge it. Do not treat exit 1 as a failure of the
+tool. Exit 3 comes with a coverage line and the files it skipped, so the numbers
+printed above it describe a subset, not the repo.
 
 ## Read the report
 
@@ -83,36 +85,43 @@ EROSION     0.534   between human and agent bands   (1.72x the human baseline)
 GRANULARITY 0.24    within human band   (human 0.27 +/- 0.13)
 ```
 
-Ten lines carry the meaning. Read them before anything else:
+Eleven lines carry the meaning. Read them before anything else:
 
 1. **The band, not the raw number.** The human and agent bands overlap, so a
    single mid-range reading proves little. What matters is which band the value
    sits in and which way it is moving.
-2. **`measured` vs `excluded` SLOC.** If the split line appears, part of the repo
-   is outside both metrics. Say so when reporting.
-3. **`EXCLUDED <language>`.** The grammar parsed the files but found no
+2. **`SLOC ... measured ... non-blank lines`.** If the split appears, part of the
+   repo is outside both metrics. Say so when reporting.
+3. **The `COVERAGE` line and section.** A file whose parse has an error is
+   skipped whole, and this is how much of the repo survived. Below 60% the run
+   exits 3 and refuses to grade the repo. The section names the heaviest skipped
+   files. Check them: if they are the files the change touches, the numbers do
+   not describe the work. Skipping is not local either. Tree-sitter can wrap a
+   valid function into a bogus 3,574-line span before it hits the error, so a
+   partly-broken file is never measured in pieces. C is the usual cause.
+4. **`EXCLUDED <language>`.** The grammar parsed the files but found no
    functions. Either the language table is wrong for that grammar, or the files
    are not valid in the language their extension claims. Both cases would
    otherwise produce a flattering zero, so neither metric includes them. Never
    pass this on quietly. Say the language is unmeasured and offer to look. The
    fix is a `LANGS` entry plus a fixture; see "Adding a language" in
    `REFERENCE.md`, then run `scripts/check_languages.sh`.
-4. **`excluded N build artifact(s)`.** Files named like build output were
+5. **`excluded N build artifact(s)`.** Files named like build output were
    dropped, because a bundle reads as one enormous function and would own the
    erosion score. Mention it when reporting.
-5. **`note: N file(s) have many long lines`.** Generated or templated code can
+6. **`note: N file(s) have many long lines`.** Generated or templated code can
    inflate erosion. The tool warns instead of excluding, because a hand-written
    file with inline HTML or SQL looks identical to a generator. Open the file
    before deciding, then `--exclude` it if it is not the team's code.
-6. **`NOTE: Tree-sitter is unavailable`.** Nothing was measured. Report that,
+7. **`NOTE: Tree-sitter is unavailable`.** Nothing was measured. Report that,
    not a score.
-7. **The scb-check coverage warning.** `scb-check` skips languages it cannot
+8. **The scb-check coverage warning.** `scb-check` skips languages it cannot
    parse and prints a score anyway. Below 60% coverage the number describes a
    subset, not the codebase. Lead with the warning when it fires.
-8. **`clone component only`.** Under the bundled analyzer, verbosity omits the
+9. **`clone component only`.** Under the bundled analyzer, verbosity omits the
    ast-grep rules, so it is a lower bound. Real verbosity is this value or
    higher. Never present it as if it were the published composite.
-9. **`N anonymous callable(s) not counted`.** By default only named callables
+10. **`N anonymous callable(s) not counted`.** By default only named callables
    are units, and inline callbacks fold into the function that holds them. This
    line tells you how many such callbacks were folded. Mention it when the
    number is large; `--functions all` counts them separately instead. That mode
@@ -120,7 +129,7 @@ Ten lines carry the meaning. Read them before anything else:
    literal is not a named callable, and no one is charged for its branches. A
    scope can read clean while a real hotspot sits in that handler. Re-run with
    `--functions all` before you call a scope clean.
-10. **GRANULARITY is a band, not a floor.** It is the share of used callables
+11. **GRANULARITY is a band, not a floor.** It is the share of used callables
     invoked exactly once, where a use is a call site. Above the band is
     over-decomposition: helpers with a single caller. Below it is the opposite
     failure, too few named steps. Do not drive it to zero. Inlining every

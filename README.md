@@ -72,7 +72,11 @@ GRANULARITY 0.240   within human band   (human 0.27 +/- 0.13)
 ```
 
 Exit `0` means a normal run. Exit `1` means erosion above the agent band, which
-is a reading and not a tool failure. Exit `2` means bad input.
+is a reading and not a tool failure. Exit `2` means bad input. Exit `3` means
+coverage below 60%, so too little of the repo parsed to judge it: the report
+names the files it skipped and refuses to place a number in a band. C projects
+tend to land here, because tree-sitter-c cannot represent `#if` inside an
+initializer or a declaration.
 
 There is also an agent skill. Installed, the skill turns a measurement into a
 report and a set of fixes. Invoke it as a slash command:
