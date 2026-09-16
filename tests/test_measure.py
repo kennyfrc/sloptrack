@@ -96,6 +96,15 @@ def clone_pair(span: int = 9) -> list[tuple[str, int, int]]:
     return [("digest", 0, span - 1), ("digest", 30, 30 + span - 1)]
 
 
+def can_parse(name: str) -> bool:
+    """Whether this interpreter can parse `name`.
+
+    An installed grammar is an environment fact, not a behavior, so the tests that
+    span the whole runner read it instead of assuming one answer.
+    """
+    return bool(measure.load_grammars({name}))
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     """A small git repository with one source file and one ignored directory."""
@@ -383,7 +392,13 @@ def test_load_grammar_returns_none_for_a_package_that_is_not_installed():
 
 
 def test_load_grammars_ignores_a_language_with_no_package():
-    assert measure.load_grammars({"ruby"}) == {} or "ruby" not in measure.load_grammars({"ruby"})
+    """A grammar package that is not published (or not installed) drops out."""
+    cfg = measure.Lang(
+        name="fiction", exts=frozenset({".fic"}), filenames=frozenset(),
+        grammar="tree_sitter_fiction",
+    )
+
+    assert measure.load_grammars({cfg.name}) == {}
 
 
 def test_load_parsers_needs_no_tree_sitter_for_an_empty_table():
@@ -434,7 +449,9 @@ def test_comment_spans_maps_each_comment_row():
 
     spans = measure.comment_spans(root, cfg, text.splitlines())
 
-    assert set(spans) == {0, 2, 3}
+    # Only the trailing comment is a comment node; the string literal is not,
+    # because it sits in an expression and not in a comment context.
+    assert set(spans) == {0}
 
 
 @needs_grammar
@@ -487,16 +504,28 @@ def test_analyze_file_reports_sloc_functions_and_references():
 
 @needs_grammar
 def test_analyze_file_counts_anonymous_callables_when_asked():
+    """Python names its callables, so this is checked on JavaScript.
+
+    A callback has no name to count, so the default reading skips it. The `all`
+    reading includes it and records how many it added, which is the flag the
+    report warns about.
+    """
     import tree_sitter
 
-    parser = tree_sitter.Parser(GRAMMARS["python"])
-    text = "def outer(rows):\n    return [f(r) for r in rows if f(r)]\n"
+    grammar = measure.load_grammars({"javascript"})
+    if not grammar:
+        pytest.skip("the javascript grammar is not installed")
+    parser = tree_sitter.Parser(grammar["javascript"])
+    text = "function outer(rows) {\n  return rows.map((r) => r + 1);\n}\n"
 
-    named = measure.analyze_file(entry("app.py", text), parser, named_only=True)
-    everything = measure.analyze_file(entry("app.py", text), parser, named_only=False)
+    named = measure.analyze_file(entry("app.js", text), parser, named_only=True)
+    everything = measure.analyze_file(entry("app.js", text), parser, named_only=False)
 
     assert [f.name for f in named.functions] == ["outer"]
-    assert len(everything.functions) > len(named.functions)
+    assert [f.name for f in everything.functions] == ["outer", "(r) => r + 1"]
+    # The counter reports what the scan saw either way; named_only decides
+    # whether the nameless callable reaches the metrics.
+    assert named.anonymous == everything.anonymous == 1
 
 
 @needs_grammar
@@ -656,8 +685,11 @@ def test_run_measurement_records_the_scan(repo: Path):
     assert [f.rel for f in run.files] == ["pkg/app.py"]
     assert run.present == {"python"}
     assert run.total_sloc > 0
-    assert run.tree_sitter is False  # the plain interpreter has no grammars
-    assert run.signals.functions == []
+    # Whether the grammars are importable is an environment fact, so assert the
+    # flag agrees with the interpreter instead of assuming one answer.
+    assert run.tree_sitter is can_parse("python")
+    if not run.tree_sitter:
+        assert run.signals.functions == []
     assert run.anonymous_skipped == 0
     assert run.git.available
 
@@ -976,7 +1008,7 @@ def test_main_prints_json_and_writes_no_report(repo: Path, capsys):
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["root"] == str(repo.resolve())
-    assert payload["engine"]["tree_sitter"] is False
+    assert payload["engine"]["tree_sitter"] is can_parse("python")
 
 
 def test_main_prints_the_text_report(repo: Path, capsys):
