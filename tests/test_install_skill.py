@@ -140,7 +140,7 @@ def test_the_installed_analyzer_runs_as_a_script(tmp_path):
         check=False,
     )
 
-    assert proc.returncode in (0, 1), proc.stderr
+    assert proc.returncode in (0, 1, 3), proc.stderr
     assert '"files_total": 1' in proc.stdout
 
 

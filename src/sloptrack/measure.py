@@ -45,6 +45,9 @@ from pathlib import Path
 HIGH_CC = 10  # HIGH_COMPLEXITY_THRESHOLD: strictly greater than this
 MIN_CLONE_STATEMENTS = 2
 MIN_CLONE_LINES = 4
+# Below this share of lines, the metrics describe too little of the repo to judge
+# it. The same 60% the reference implementation's coverage check uses.
+LOW_COVERAGE = 0.60
 # Locations listed per duplicate block; the occurrence count is never truncated.
 DUPLICATE_LOCATIONS = 4  # a normalized clone must span at least this many SLOC
 
@@ -693,6 +696,10 @@ class FileAnalysis:
     clone_candidates: list[tuple[str, int, int]] = field(default_factory=list)
     parsed: bool = False
     anonymous: int = 0
+    # Why this file is not in the metrics, when it is not: an ERROR or MISSING node
+    # from the grammar, no grammar at all, or a grammar that raised. Empty means the
+    # parse is clean and the file was measured.
+    parse_problem: str = ""
     # Call-site counts by callee name. The cross-file sum is the use count for
     # the granularity metric.
     references: dict[str, int] = field(default_factory=dict)
@@ -716,10 +723,19 @@ class Func:
 
 
 def analyze_file(entry: FileEntry, parser, named_only: bool = True) -> FileAnalysis:
-    """Parse one file and extract SLOC, comment rows, functions, clone candidates."""
+    """Parse one file and extract SLOC, comment rows, functions, clone candidates.
+
+    A tree containing an ERROR or MISSING node is not trustworthy: the grammar
+    lost the structure, so function spans, complexity counts, and clone spans all
+    come out wrong. Those files fall back to SLOC and say why, because a confident
+    wrong number is worse than an admitted gap.
+    """
     tree = parser.parse(entry.text.encode("utf-8", errors="replace"))
     root = tree.root_node
     cfg = entry.lang
+    problem = tree_problem(root)
+    if problem:
+        return unparsed(entry, problem)
     lines = entry.text.splitlines()
 
     spans = comment_spans(root, cfg, lines)
@@ -731,6 +747,33 @@ def analyze_file(entry: FileEntry, parser, named_only: bool = True) -> FileAnaly
         parsed=True, anonymous=scan.anonymous,
         references=_call_references(root, cfg, scan.declared_ids, scan.self_spans),
     )
+
+
+def tree_problem(root) -> str:
+    """The parse problem that makes a tree untrustworthy, or an empty string.
+
+    Both node kinds mean the same thing for measurement: the grammar could not fit
+    the source, so anything derived from this tree describes the grammar rather
+    than the code. `has_error` already covers both, so a clean tree costs one flag
+    and only a damaged tree gets walked.
+    """
+    if not root.has_error:
+        return ""
+    errors = missing = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "ERROR":
+            errors += 1
+        elif node.is_missing:
+            missing += 1
+        stack.extend(node.children)
+    parts = []
+    if errors:
+        parts.append(f"{errors} syntax error(s)")
+    if missing:
+        parts.append(f"{missing} missing token(s)")
+    return "the grammar could not parse it: " + " and ".join(parts)
 
 
 def comment_spans(root, cfg: Lang, lines: list[str]) -> dict[int, list[tuple[int, int]]]:
@@ -1651,9 +1694,12 @@ def load_parsers(grammars: dict[str, object]) -> tuple[dict[str, object], bool]:
     return parsers, True
 
 
-def unparsed(entry: FileEntry) -> FileAnalysis:
-    """A file that still counts for SLOC but contributed no parse."""
-    return FileAnalysis(entry=entry, sloc=_fallback_sloc(entry.text), comment_rows=set())
+def unparsed(entry: FileEntry, reason: str) -> FileAnalysis:
+    """A file that still counts for SLOC but contributed no parse, and why."""
+    return FileAnalysis(
+        entry=entry, sloc=_fallback_sloc(entry.text), comment_rows=set(),
+        parsed=False, parse_problem=reason,
+    )
 
 
 def analyze_files(
@@ -1667,13 +1713,13 @@ def analyze_files(
             continue
         parser = parsers.get(entry.lang.name)
         if parser is None:
-            results.append(unparsed(entry))
+            results.append(unparsed(entry, "no grammar available for this language"))
             continue
         try:
             results.append(analyze_file(entry, parser, named_only=named_only))
-        except Exception:  # noqa: BLE001 - a bad grammar must not kill the run
+        except Exception as exc:  # noqa: BLE001 - a bad grammar must not kill the run
             failures[entry.lang.name] += 1
-            results.append(unparsed(entry))
+            results.append(unparsed(entry, f"the grammar raised {type(exc).__name__}"))
     return results, dict(failures)
 
 
@@ -1730,6 +1776,40 @@ class Run:
     @property
     def anonymous_skipped(self) -> int:
         return sum(result.anonymous for result in self.analyzed)
+
+    @property
+    def total_lines(self) -> int:
+        """Non-blank lines across every file, parsed or not.
+
+        The coverage denominator, and the only honest total for a file that
+        never parsed: without a tree there is no way to know which lines are
+        comments, so SLOC is not available for it.
+        """
+        return sum(_fallback_sloc(result.entry.text) for result in self.results)
+
+    @property
+    def excluded_parses(self) -> list[FileAnalysis]:
+        """Files that were read but not measured, heaviest first.
+
+        Ordered by non-blank lines so the report can name the ones that matter,
+        rather than listing a thousand headers.
+        """
+        broken = [r for r in self.results if r.parse_problem]
+        return sorted(broken, key=lambda r: -_fallback_sloc(r.entry.text))
+
+    @property
+    def coverage(self) -> float:
+        """The share of non-blank lines that reached the metrics.
+
+        Lines, not SLOC, on both sides: a file that did not parse can only be
+        counted in raw lines, so using SLOC for the numerator would compare two
+        different units and flatter the ratio.
+        """
+        total = sum(_fallback_sloc(result.entry.text) for result in self.results)
+        if not total:
+            return 1.0
+        measured = sum(_fallback_sloc(result.entry.text) for result in self.analyzed)
+        return measured / total
 
 
 def run_measurement(target: Target, args: argparse.Namespace) -> Run:
@@ -1828,6 +1908,10 @@ def language_sloc(results: list[FileAnalysis]) -> dict[str, dict[str, int]]:
 
 def engine_payload(run: Run) -> dict:
     """What the engine saw: grammars, exclusions, and what it could not parse."""
+    excluded = [
+        {"file": r.entry.rel, "lines": _fallback_sloc(r.entry.text), "reason": r.parse_problem}
+        for r in run.excluded_parses[:10]
+    ]
     return {
         "tree_sitter": run.tree_sitter,
         "grammars": sorted(run.grammars),
@@ -1841,6 +1925,8 @@ def engine_payload(run: Run) -> dict:
             {"file": rel, "share": round(share, 3)} for rel, share in run.long_lines[:10]
         ],
         "parse_failures": run.failures,
+        "unparsed_files": excluded,
+        "unparsed_files_total": len(run.excluded_parses),
         "scb_check": bool(run.scb),
         "scb_check_coverage": scb_coverage(run),
         "scb_check_error": run.scb_error,
@@ -1848,13 +1934,22 @@ def engine_payload(run: Run) -> dict:
 
 
 def sloc_payload(run: Run) -> dict:
-    """Line counts: total, measured, and the difference the metrics ignore."""
+    """Line counts: measured, the rest, and the coverage the split implies.
+
+    `measured_sloc` is real SLOC, because a parse found the comments and the
+    punctuation-only lines. The rest and the total are non-blank lines, the only
+    unit available for a file that never parsed. The two are reported side by
+    side rather than summed into one "SLOC" figure that would be neither.
+    """
     return {
         "total": run.total_sloc,
         "measured": run.measured_sloc,
         "unmeasured": run.total_sloc - run.measured_sloc,
+        "total_lines": run.total_lines,
         "files_total": len(run.results),
         "files_measured": len(run.analyzed),
+        "coverage": round(run.coverage, 4),
+        "low_coverage": run.coverage < LOW_COVERAGE,
         "by_language": language_sloc(run.results),
     }
 
@@ -1984,8 +2079,19 @@ def main(argv: list[str] | None = None) -> int:
     payload = build_payload(run)
     if args.json:
         print(json.dumps(payload, indent=2, default=str))
-        return 0
+        return exit_code(run)
     print_report(payload)
+    return exit_code(run)
+
+
+def exit_code(run: Run) -> int:
+    """0 clean, 1 erosion above the agent band, 3 too little parsed to judge.
+
+    Coverage is checked first: a metric describing a sliver of the repo cannot
+    outrank the fact that most of it was never read.
+    """
+    if run.coverage < LOW_COVERAGE:
+        return 3
     erosion = run.signals.erosion
     return 1 if (erosion is not None and erosion > BANDS["erosion"]["agent"]) else 0
 
@@ -2013,10 +2119,37 @@ def print_inputs(p: dict) -> None:
     print(f"  languages      {languages}")
     sloc = p["sloc"]
     if sloc["unmeasured"]:
-        print(f"  total SLOC     {sloc['total']}  ({sloc['measured']} measured,"
-              f" {sloc['unmeasured']} excluded)")
+        print(f"  SLOC           {sloc['measured']} measured of {sloc['total_lines']}"
+              f" non-blank lines  ({sloc['unmeasured']} lines outside the metrics)")
     else:
-        print(f"  total SLOC     {sloc['total']}")
+        print(f"  SLOC           {sloc['measured']}")
+
+
+def print_coverage(p: dict) -> None:
+    """How much of the repo the metrics actually describe, before they are read.
+
+    This is the gate on every number below it. A parse the grammar could not fit
+    is not a small shortfall: function spans, complexity, and clone spans all come
+    from that tree, so the report says which files are missing and refuses to call
+    the result a measurement when too little parsed.
+    """
+    sloc = p["sloc"]
+    engine = p["engine"]
+    share = sloc["coverage"]
+    print(f"  COVERAGE    {share:.0%} of non-blank lines measured")
+    if not engine["unparsed_files"]:
+        return
+    print(f"              {engine['unparsed_files_total']} file(s) could not be parsed:")
+    for item in engine["unparsed_files"][:5]:
+        print(f"                {item['lines']:>6} lines  {item['file']}  ({item['reason']})")
+    hidden = engine["unparsed_files_total"] - len(engine["unparsed_files"][:5])
+    if hidden > 0:
+        print(f"                (+{hidden} smaller file(s))")
+    if sloc["low_coverage"]:
+        print(f"\n  WARNING: under {LOW_COVERAGE:.0%} of this repo parsed, so these numbers")
+        print("           describe the files that did. Fix the parse or measure a")
+        print("           narrower scope before trusting or fixing anything below.")
+        print("           A language whose grammar cannot parse it cannot be judged here.")
 
 
 def print_engine_notes(engine: dict) -> None:
@@ -2045,9 +2178,10 @@ def print_engine_notes(engine: dict) -> None:
     if engine["unreliable_languages"]:
         print(f"  EXCLUDED {', '.join(engine['unreliable_languages'])}: parsed, but found no"
               " functions.")
-        print("           Either the node vocabulary is wrong for that grammar, or the")
-        print("           files are not valid in the language their extension claims.")
-        print("           Both make for a flattering zero, so neither metric includes them.")
+        print("           Straight-line scripts with no callables look like this, and so")
+        print("           does a node vocabulary that is wrong for the grammar. Check one")
+        print("           file before assuming either. Both cases make for a flattering")
+        print("           zero, so neither metric includes them.")
     if engine["parse_failures"]:
         print(f"  parse failures {engine['parse_failures']}")
 
@@ -2195,6 +2329,8 @@ def print_report(p: dict) -> None:
     print(f"SLOP REPORT  {p['root']}")
     print_inputs(p)
     print_engine_notes(p["engine"])
+    print()
+    print_coverage(p)
     print()
     print_metrics(p)
     print_growth(p)

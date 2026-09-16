@@ -43,7 +43,10 @@ def test_langs_lists_every_table_entry(capsys):
 
 
 def test_measure_is_the_default_command(tmp_path, capsys):
-    assert cli.main([str(repo(tmp_path)), "--no-uvx", "--no-git"]) in (0, 1)
+    """Without grammars the run still reports, and refuses to call itself clean."""
+    code = cli.main([str(repo(tmp_path)), "--no-uvx", "--no-git"])
+
+    assert code in (0, 1, 3)
     assert "SLOP REPORT" in capsys.readouterr().out
 
 
@@ -58,14 +61,14 @@ def test_explicit_measure_matches_the_default(tmp_path, capsys):
 
 def test_no_uvx_is_stripped_before_measure_sees_it(tmp_path):
     """measure has no --no-uvx flag, so passing it through would be an error."""
-    assert cli.main(["measure", str(repo(tmp_path)), "--no-uvx", "--no-git"]) in (0, 1)
+    assert cli.main(["measure", str(repo(tmp_path)), "--no-uvx", "--no-git"]) in (0, 1, 3)
 
 
 def test_json_flag_reaches_measure(tmp_path, capsys):
     code = cli.main([str(repo(tmp_path)), "--no-uvx", "--no-git", "--json"])
 
     payload = json.loads(capsys.readouterr().out)
-    assert code in (0, 1)
+    assert code in (0, 1, 3)
     assert payload["sloc"]["files_total"] == 1
     assert set(payload) >= {"verbosity", "erosion", "granularity", "git"}
 

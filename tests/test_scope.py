@@ -59,7 +59,8 @@ def measured(path, *extra: str) -> dict:
     buf = io.StringIO()
     with redirect_stdout(buf):
         code = measure_module.main([str(path), "--json", "--no-git", *extra])
-    assert code in (0, 1), code
+    # 3 means too little parsed to judge, which is what a bare interpreter does.
+    assert code in (0, 1, 3), code
     return json.loads(buf.getvalue())
 
 

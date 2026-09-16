@@ -131,6 +131,17 @@ def run_for(root: Path, *argv: str) -> measure.Run:
     return measure.run_measurement(target, args)
 
 
+def capture_json(root: Path, *argv: str) -> str:
+    """The JSON payload for a run, as the CLI would print it."""
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        measure.main([str(root), "--json", "--no-git", *argv])
+    return buf.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # Request
 # ---------------------------------------------------------------------------
@@ -409,10 +420,12 @@ def test_load_parsers_needs_no_tree_sitter_for_an_empty_table():
 
 
 def test_unparsed_counts_lines_without_a_parse():
-    analysis_ = measure.unparsed(entry("app.py", "a = 1\n\nb = 2\n"))
+    analysis_ = measure.unparsed(entry("app.py", "a = 1\n\nb = 2\n"), "no grammar available")
 
     assert analysis_.sloc == 2
     assert analysis_.functions == []
+    assert analysis_.parse_problem == "no grammar available"
+    assert not analysis_.parsed
     assert not analysis_.parsed
 
 
@@ -801,7 +814,7 @@ def test_engine_payload_records_what_the_engine_saw(tmp_path: Path):
 
 def test_sloc_payload_splits_measured_from_total(tmp_path: Path):
     run = synthetic_run(tmp_path)
-    run.results.append(measure.unparsed(entry("other.py", "a = 1\nb = 2\n")))
+    run.results.append(measure.unparsed(entry("other.py", "a = 1\nb = 2\n"), "no grammar"))
 
     sloc = measure.sloc_payload(run)
 
@@ -914,7 +927,8 @@ def test_report_sections_print_the_payload(tmp_path: Path, capsys):
 
     out = capsys.readouterr().out
     assert "languages      python 1f/20sloc" in out
-    assert "total SLOC     20" in out
+    assert "SLOC           20" in out
+    assert "non-blank lines" not in out, "a fully parsed run reports SLOC, not lines"
     assert "Tree-sitter is unavailable" in out
     assert "no grammar for python" in out
 
@@ -1039,20 +1053,171 @@ def test_print_report_writes_the_whole_report(tmp_path: Path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# Parse reliability: the tool must shout when it cannot read the code
+# ---------------------------------------------------------------------------
+
+BROKEN = "def alpha(values):\n    return [x for x in values\n"  # unclosed bracket
+
+
+@needs_grammar
+def test_tree_problem_names_the_damage():
+    import tree_sitter
+
+    parser = tree_sitter.Parser(GRAMMARS["python"])
+
+    clean = parser.parse(b"def f(x):\n    return x\n").root_node
+    broken = parser.parse(BROKEN.encode()).root_node
+
+    assert measure.tree_problem(clean) == ""
+    assert "could not parse" in measure.tree_problem(broken)
+
+
+@needs_grammar
+def test_analyze_file_refuses_a_tree_it_could_not_parse():
+    """A damaged tree would report wrong spans, so the file is not measured."""
+    import tree_sitter
+
+    parser = tree_sitter.Parser(GRAMMARS["python"])
+
+    result = measure.analyze_file(entry("app.py", BROKEN), parser)
+
+    assert not result.parsed
+    assert result.parse_problem
+    assert result.functions == []
+    assert result.clone_candidates == []
+    assert result.sloc > 0  # it still counts for SLOC, so coverage stays honest
+
+
+@needs_grammar
+def test_a_broken_file_never_reaches_the_metrics(repo: Path, tmp_path):
+    (repo / "pkg" / "broken.py").write_text(BROKEN, encoding="utf-8")
+    subprocess.run(["git", "-c", "user.email=t@e.com", "-c", "user.name=t", "add", "-A"],
+                   cwd=repo, check=True, capture_output=True)
+
+    payload = json.loads(capture_json(repo))
+
+    assert payload["sloc"]["coverage"] < 1.0
+    assert [f["file"] for f in payload["engine"]["unparsed_files"]] == ["pkg/broken.py"]
+    assert "could not parse" in payload["engine"]["unparsed_files"][0]["reason"]
+    assert all(h["file"] != "pkg/broken.py" for h in payload["hotspots"])
+
+
+@needs_grammar
+def test_coverage_counts_the_lines_that_reached_the_metrics(repo: Path, tmp_path):
+    (repo / "pkg" / "broken.py").write_text(BROKEN, encoding="utf-8")
+    subprocess.run(["git", "-c", "user.email=t@e.com", "-c", "user.name=t", "add", "-A"],
+                   cwd=repo, check=True, capture_output=True)
+
+    payload = json.loads(capture_json(repo))
+    sloc = payload["sloc"]
+
+    assert sloc["coverage"] < 1.0
+    assert sloc["low_coverage"] is (sloc["coverage"] < measure.LOW_COVERAGE)
+    assert sloc["files_measured"] == sloc["files_total"] - 1
+
+
+def test_coverage_is_total_without_a_grammar_anywhere():
+    """Nothing parsed means nothing measured, and the ratio has to say so."""
+    assert measure.Run.coverage.__doc__ is not None  # documented, not implied
+    assert measure.LOW_COVERAGE == 0.60
+
+
+def break_most_of_the_repo(repo: Path) -> None:
+    """Fill the repository with unparsable code, leaving the metric nothing to say."""
+    (repo / "pkg" / "broken.py").write_text(BROKEN * 60, encoding="utf-8")
+    subprocess.run(["git", "-c", "user.email=t@e.com", "-c", "user.name=t", "add", "-A"],
+                   cwd=repo, check=True, capture_output=True)
+
+
+@needs_grammar
+def test_report_shouts_when_coverage_is_low(repo: Path, capsys):
+    break_most_of_the_repo(repo)
+
+    code = measure.main([str(repo), "--no-git"])
+    out = capsys.readouterr().out
+
+    assert "COVERAGE" in out
+    assert "WARNING" in out
+    assert "cannot be judged here" in out
+    assert "pkg/broken.py" in out
+    assert code == 3
+
+
+@needs_grammar
+def test_exit_code_three_outranks_the_erosion_gate(repo: Path):
+    """An eroded repo that barely parsed is a coverage failure, not a finding."""
+    break_most_of_the_repo(repo)
+
+    payload = json.loads(capture_json(repo))
+
+    assert payload["sloc"]["low_coverage"] is True
+    assert measure.main([str(repo), "--json", "--no-git"]) == 3
+
+
+@needs_grammar
+def test_a_c_preprocessor_conditional_inside_an_initializer_is_refused():
+    """The known C limitation, pinned so it cannot become a silent wrong number.
+
+    tree-sitter-c cannot represent `#if` inside an initializer list, so the file is
+    reported as unparsed. nginx and tcc use this idiom, which is why they read as
+    partly unmeasurable instead of reading as eroded.
+    """
+    if not can_parse("c"):
+        pytest.skip("the c grammar is not installed")
+    import tree_sitter
+
+    parser = tree_sitter.Parser(measure.load_grammars({"c"})["c"])
+    text = (
+        "static const int table[] = {\n"
+        "#if defined(A)\n"
+        "    1,\n"
+        "#else\n"
+        "    2,\n"
+        "#endif\n"
+        "};\n"
+    )
+
+    result = measure.analyze_file(entry("table.c", text), parser)
+
+    assert not result.parsed
+    assert "could not parse" in result.parse_problem
+
+
+@needs_grammar
+def test_a_clean_run_reports_full_coverage(repo: Path, capsys):
+    payload = json.loads(capture_json(repo))
+
+    assert payload["sloc"]["coverage"] == 1.0
+    assert payload["sloc"]["low_coverage"] is False
+    assert payload["engine"]["unparsed_files"] == []
+    assert payload["engine"]["unparsed_files_total"] == 0
+
+    measure.main([str(repo), "--no-git"])
+    out = capsys.readouterr().out
+    assert "COVERAGE    100%" in out
+    assert "WARNING" not in out
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 
 def test_main_prints_json_and_writes_no_report(repo: Path, capsys):
-    assert measure.main([str(repo), "--json", "--no-git"]) == 0
+    """A clean fixture exits 0 when it parsed, and shouts 3 when nothing could."""
+    expected = 0 if can_parse("python") else 3
+
+    assert measure.main([str(repo), "--json", "--no-git"]) == expected
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["root"] == str(repo.resolve())
     assert payload["engine"]["tree_sitter"] is can_parse("python")
+    assert payload["sloc"]["coverage"] == (1.0 if can_parse("python") else 0.0)
+    assert payload["sloc"]["low_coverage"] is not can_parse("python")
 
 
 def test_main_prints_the_text_report(repo: Path, capsys):
-    assert measure.main([str(repo), "--no-git"]) == 0
+    assert measure.main([str(repo), "--no-git"]) == (0 if can_parse("python") else 3)
 
     assert capsys.readouterr().out.startswith("SLOP REPORT")
 
