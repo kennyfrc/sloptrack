@@ -62,6 +62,15 @@ def checkout_skill_dir() -> Path:
     return package_dir() / "skill"
 
 
+def _dangling(target: Path) -> bool:
+    """True when target is a symlink whose destination is gone.
+
+    That is what a checkout leaves behind when it moves, and a missing SKILL.md is
+    how the agent loader reports it.
+    """
+    return target.is_symlink() and not target.resolve().exists()
+
+
 def install(dest_root: str | Path, *, link: bool = False, force: bool = False) -> Install:
     """Install the skill under `dest_root`, replacing an existing one only with force."""
     source = checkout_skill_dir() if link else bundled_skill()
@@ -69,15 +78,23 @@ def install(dest_root: str | Path, *, link: bool = False, force: bool = False) -
         raise RuntimeError(f"skill payload is missing: {source}")
 
     target = Path(dest_root).expanduser() / SKILL_NAME
-    if target.is_symlink() or target.exists():
+    if _dangling(target):
+        # Nothing is installed, so this is not an install to protect. Replacing it
+        # keeps a moved checkout from needing --force.
+        print(f"note: replacing the broken symlink at {target}", file=sys.stderr)
+        target.unlink()
+    elif target.is_symlink() or target.is_file():
         if not force:
             raise FileExistsError(
                 f"{target} already exists. Re-run with --force to replace it."
             )
-        if target.is_symlink() or target.is_file():
-            target.unlink()
-        else:
-            shutil.rmtree(target)
+        target.unlink()
+    elif target.exists():
+        if not force:
+            raise FileExistsError(
+                f"{target} already exists. Re-run with --force to replace it."
+            )
+        shutil.rmtree(target)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     if link:

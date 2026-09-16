@@ -782,9 +782,19 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Verify language vocabularies on known-answer fixtures.")
     ap.add_argument("--lang", action="append", default=[], help="check only this language (repeatable)")
     ap.add_argument("--verbose", action="store_true", help="list every function found per language")
+    ap.add_argument(
+        "--print-requirements", action="store_true",
+        help="print the grammar packages the requested languages need, then exit",
+    )
     args = ap.parse_args(argv)
 
     wanted = args.lang or list(SAMPLES)
+    if args.print_requirements:
+        # Uses the LANGS table rather than importing the grammars, so a wrapper can
+        # ask which packages to install before they exist.
+        known = {lang.name for lang in m.LANGS}
+        print(" ".join(m.grammar_packages({name for name in wanted if name in known})))
+        return 0
     unknown = [name for name in wanted if name not in SAMPLES]
     if unknown:
         print(f"error: no fixture for {', '.join(unknown)}", file=sys.stderr)

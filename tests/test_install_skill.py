@@ -72,6 +72,39 @@ def test_force_replaces_a_symlink(tmp_path):
     assert (result.path / "SKILL.md").is_file()
 
 
+def test_a_dangling_symlink_is_replaced_without_force(tmp_path, capsys):
+    """A moved checkout leaves a symlink to nothing, and the loader then reports a
+    missing SKILL.md. That is not an install worth protecting."""
+    target = tmp_path / install_skill.SKILL_NAME
+    target.symlink_to(tmp_path / "moved-away", target_is_directory=True)
+    assert not target.exists()
+
+    result = install_skill.install(tmp_path)
+
+    assert "broken symlink" in capsys.readouterr().err
+    assert not result.path.is_symlink()
+    assert (result.path / "SKILL.md").is_file()
+
+
+def test_a_link_install_heals_a_dangling_link(tmp_path):
+    target = tmp_path / install_skill.SKILL_NAME
+    target.symlink_to(tmp_path / "moved-away", target_is_directory=True)
+
+    result = install_skill.install(tmp_path, link=True)
+
+    assert result.path.is_symlink()
+    assert (result.path / "SKILL.md").is_file()
+
+
+def test_the_installed_skill_exposes_skill_md_at_its_root(tmp_path):
+    """The loader opens <skill>/SKILL.md, so the payload cannot nest a level deeper."""
+    result = install_skill.install(tmp_path)
+    entry = result.path / "SKILL.md"
+
+    assert entry.is_file()
+    assert entry.read_text(encoding="utf-8").startswith("---")
+
+
 def test_link_install_points_at_the_checkout(tmp_path):
     result = install_skill.install(tmp_path, link=True)
 

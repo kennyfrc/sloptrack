@@ -33,6 +33,28 @@ def test_every_language_has_a_grammar_and_a_fixture():
     assert set(LANGUAGES) == set(check_languages.SAMPLES)
 
 
+def test_print_requirements_lists_grammar_packages(capsys):
+    """The wrapper asks this before anything is installed, so it must not import grammars."""
+    assert check_languages.main(["--print-requirements"]) == 0
+    packages = capsys.readouterr().out.split()
+
+    assert packages == measure.grammar_packages({lang.name for lang in measure.LANGS})
+    assert "tree-sitter-python" in packages
+
+
+def test_print_requirements_narrows_to_the_requested_languages(capsys):
+    assert check_languages.main(["--print-requirements", "--lang", "python", "--lang", "bash"]) == 0
+
+    assert capsys.readouterr().out.split() == ["tree-sitter-bash", "tree-sitter-python"]
+
+
+def test_print_requirements_ignores_an_unknown_language(capsys):
+    """An unknown name is reported by the check itself, not by the package list."""
+    assert check_languages.main(["--print-requirements", "--lang", "nope"]) == 0
+
+    assert capsys.readouterr().out.strip() == ""
+
+
 @needs_every_grammar
 def test_the_whole_corpus_passes(capsys):
     assert check_languages.main([]) == 0

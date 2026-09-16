@@ -16,17 +16,17 @@ SKILL_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TREE_SITTER_VERSION="0.25.2"
 
 # An installed skill carries its own copy of both scripts next to this one. In a
-# source checkout they live two directories up, in the package.
+# source checkout they live two directories up, in the package, where the analyzer
+# is named measure.py rather than slop_measure.py.
 if [ -f "$SKILL_DIR/slop_measure.py" ]; then
   PKG_DIR="$SKILL_DIR"
 elif [ -f "$SKILL_DIR/../../measure.py" ]; then
   PKG_DIR="$(cd "$SKILL_DIR/../.." && pwd)"
 else
-  echo "error: slop_measure.py not found next to $SKILL_DIR or in the package above it" >&2
+  echo "error: the analyzer is not next to $SKILL_DIR or in the package above it" >&2
   echo "       reinstall with: sloptrack install-skill --force" >&2
   exit 2
 fi
-MEASURE="$PKG_DIR/slop_measure.py"
 CHECK="$PKG_DIR/check_languages.py"
 
 if ! command -v uvx >/dev/null 2>&1; then
@@ -34,15 +34,13 @@ if ! command -v uvx >/dev/null 2>&1; then
   exec python3 "$CHECK" "$@"
 fi
 
-pkgs="$(python3 - "$SKILL_DIR" <<'PY'
-import sys
-
-sys.path.insert(0, sys.argv[1])
-import slop_measure
-
-print(" ".join(sorted({l.grammar.replace("_", "-") for l in slop_measure.LANGS if l.grammar})))
-PY
-)"
+# The checker owns the language table, so it also answers which packages supply
+# the grammars. It reads the table only, so this works before anything is installed.
+pkgs="$(python3 "$CHECK" --print-requirements "$@")"
+if [ -z "$pkgs" ]; then
+  echo "error: no grammar packages reported for this request" >&2
+  exit 2
+fi
 
 with_args=()
 for pkg in $pkgs; do

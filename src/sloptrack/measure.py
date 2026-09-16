@@ -541,14 +541,22 @@ def discover(root: Path, excludes: list[str], use_git: bool) -> list[FileEntry]:
                 capture_output=True, text=True, timeout=60,
             )
             if out.returncode == 0:
-                for rel in out.stdout.split("\0"):
-                    if not rel:
+                for tracked in out.stdout.split("\0"):
+                    if not tracked:
                         continue
-                    p = repo / rel
+                    p = repo / tracked
                     if p.is_symlink() or not p.is_file():
                         continue
-                    if any(part in SKIP_DIRS for part in Path(rel).parts):
+                    resolved = p.resolve()
+                    # git lists the whole repository; the scope is `root`.
+                    if not resolved.is_relative_to(root):
                         continue
+                    if any(part in SKIP_DIRS for part in Path(tracked).parts):
+                        continue
+                    # Paths are relative to the measured scope, so a report never
+                    # names directories the caller did not ask for, and an
+                    # --exclude glob means the same thing with and without a subtree.
+                    rel = str(resolved.relative_to(root))
                     if not keep(p, rel):
                         continue
                     lang = lang_for(p)
@@ -1350,15 +1358,18 @@ def main(argv: list[str] | None = None) -> int:
         scan_dir = root
 
     scan_root = git_root(scan_dir) or scan_dir
+    # The reported scope is what was asked for, not the repository that holds it:
+    # a subtree run answers a different question from a repository run.
+    scope = requested.path if requested is not None else root
     if requested is not None:
         files = [requested]
     else:
-        files = discover(scan_root, args.exclude, use_git=not args.no_git)
+        files = discover(root, args.exclude, use_git=not args.no_git)
     if args.lang:
         want = set(args.lang)
         files = [f for f in files if f.lang.name in want]
     if not files:
-        print(f"error: no recognized source files under {scan_root}", file=sys.stderr)
+        print(f"error: no recognized source files under {scope}", file=sys.stderr)
         print("       recognized:", " ".join(sorted(BY_EXT)) + " " + " ".join(sorted(BY_FILENAME)),
               file=sys.stderr)
         print("       add the language to LANGS in this script, or run scb-check directly.",
@@ -1484,7 +1495,7 @@ def main(argv: list[str] | None = None) -> int:
         by_lang[r.entry.lang.name]["sloc"] += r.sloc
 
     payload = {
-        "root": str(scan_root),
+        "root": str(scope),
         "engine": {
             "tree_sitter": ts_ok,
             "grammars": sorted(grammars),
