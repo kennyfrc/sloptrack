@@ -8,9 +8,21 @@
 
 set -euo pipefail
 
-SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MEASURE="$SKILL_DIR/slop_measure.py"
+# -P resolves symlinks, so a --link install still finds the package above it.
+SKILL_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 TREE_SITTER_VERSION="0.25.2"
+
+# An installed skill carries its own copy of the analyzer next to this script.
+# In a source checkout, the analyzer lives two directories up in the package.
+if [ -f "$SKILL_DIR/slop_measure.py" ]; then
+  MEASURE="$SKILL_DIR/slop_measure.py"
+elif [ -f "$SKILL_DIR/../../measure.py" ]; then
+  MEASURE="$(cd "$SKILL_DIR/../.." && pwd)/measure.py"
+else
+  echo "error: slop_measure.py not found next to $SKILL_DIR or in the package above it" >&2
+  echo "       reinstall with: sloptrack install-skill --force" >&2
+  exit 2
+fi
 
 target="."
 for arg in "$@"; do

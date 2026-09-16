@@ -223,8 +223,10 @@ warning without fixing the table.
 
 ### Adding a language
 
-One entry in the `LANGS` table in `scripts/slop_measure.py`, plus one fixture in
-`scripts/check_languages.py`. The reference CLI carries a parser config per
+One entry in the `LANGS` table in `src/sloptrack/measure.py`, plus one fixture in
+`src/sloptrack/check_languages.py`. An installed skill holds copies of both at
+`scripts/slop_measure.py` and `scripts/check_languages.py`, so edit the package
+and reinstall rather than the copy. The reference CLI carries a parser config per
 language and states the same duties for a new one: config, dispatch mapping,
 language value, discovery, clone config, tests, and docs. Read its configs when
 a grammar is unclear. They are short and use the same node vocabulary this table
@@ -244,6 +246,7 @@ Then run the checker:
 ```bash
 ~/.agents/skills/measure-then-fix-slop/scripts/check_languages.sh
 ~/.agents/skills/measure-then-fix-slop/scripts/check_languages.sh --lang bash --verbose
+sloptrack check-languages --lang bash --verbose    # same check, installed CLI
 ```
 
 The fixture is two copies of one function with a branch and a loop inside. It

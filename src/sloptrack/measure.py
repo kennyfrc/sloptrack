@@ -19,8 +19,12 @@ Never reports a confident zero: a language that parses but yields no functions
 is marked unreliable and excluded from the aggregate.
 
 Usage:
-    slop_measure.py [PATH] [--json] [--since REF] [--top N] [--lang LANG]
-                    [--scb] [--no-git] [--exclude GLOB]
+    sloptrack measure [PATH] [--json] [--since REF] [--top N] [--lang LANG]
+                      [--scb] [--no-git] [--exclude GLOB] [--functions named|all]
+
+This file is also runnable on its own, which is how the agent skill calls it:
+`python3 slop_measure.py [flags]`. It needs Tree-sitter and the grammar packages
+for the target's languages; `sloptrack measure` supplies them through uvx.
 """
 
 from __future__ import annotations
@@ -1209,7 +1213,98 @@ def granularity_band(value: float) -> str:
     return "within human band"
 
 
-def main() -> int:
+@dataclass
+class Signals:
+    """The metric values plus the lists the payload entries are built from."""
+
+    groups: dict[str, list[tuple[str, int, int]]]
+    clone_lines: int
+    used_functions: list[Func]
+    reused_functions: list[Func]
+    single_use_functions: list[Func]
+    unused_functions: list[Func]
+    granularity: float | None
+    total_mass: float
+    high_mass: float
+    erosion: float | None
+    high_cc: list[Func]
+
+
+def compute_signals(functions: list[Func], analyzed: list[FileAnalysis]) -> Signals:
+    """Compute verbosity's numerator, erosion, and granularity from parsed files.
+
+    Takes the functions and the trustworthy file analyses, and returns the values
+    plus the candidate lists the report ranks. Split out of main() so the metric
+    math can be checked without a Tree-sitter grammar.
+    """
+    # Granularity: a named callable invoked once is premature reuse (Muratori,
+    # "Semantic Compression"). References are summed across the corpus by name,
+    # so same-name definitions share a count. Zero-use callables are excluded
+    # from the ratio and listed separately: they are entry points, exports, or
+    # dead code, and the metric cannot tell which.
+    references: dict[str, int] = defaultdict(int)
+    for r in analyzed:
+        for ref_name, count in r.references.items():
+            references[ref_name] += count
+    for f in functions:
+        f.uses = references.get(f.name, 0)
+
+    used_functions = [f for f in functions if f.uses >= 1]
+    reused_functions = [f for f in used_functions if f.uses >= 2]
+    single_use_functions = [f for f in used_functions if f.uses == 1]
+    unused_functions = [f for f in functions if f.uses == 0]
+    granularity = (len(single_use_functions) / len(used_functions)) if used_functions else None
+
+    total_mass = sum(f.mass for f in functions)
+    high_mass = sum(f.mass for f in functions if f.cc > HIGH_CC)
+    erosion = high_mass / total_mass if total_mass else None
+    high_cc = [f for f in functions if f.cc > HIGH_CC]
+
+    # Clone rows: a digest seen in two places marks both spans as duplicate lines.
+    clone_rows: dict[str, set[int]] = defaultdict(set)
+    groups: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
+    for r in analyzed:
+        for digest, start, end in r.clone_candidates:
+            groups[digest].append((r.entry.rel, start, end))
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        if members[0][2] - members[0][1] + 1 < MIN_CLONE_LINES:
+            continue
+        for rel, start, end in members:
+            clone_rows[rel].update(range(start, end + 1))
+    clone_lines = 0
+    for rel, rows in clone_rows.items():
+        analysis = next((r for r in analyzed if r.entry.rel == rel), None)
+        if analysis is None:
+            continue
+        clone_lines += len({row for row in rows if row not in analysis.comment_rows})
+
+    return Signals(
+        groups=groups,
+        clone_lines=clone_lines,
+        used_functions=used_functions,
+        reused_functions=reused_functions,
+        single_use_functions=single_use_functions,
+        unused_functions=unused_functions,
+        granularity=granularity,
+        total_mass=total_mass,
+        high_mass=high_mass,
+        erosion=erosion,
+        high_cc=high_cc,
+    )
+
+
+def grammar_packages(languages: set[str]) -> list[str]:
+    """The pip packages that supply grammars for these languages."""
+    return sorted(
+        lang.grammar.replace("_", "-")
+        for lang in LANGS
+        if lang.name in languages and lang.grammar
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Measure code slop (verbosity and structural erosion).")
     ap.add_argument("path", nargs="?", default=".", help="repository or directory to measure")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a text report")
@@ -1231,7 +1326,7 @@ def main() -> int:
         "--print-requirements", action="store_true",
         help="print the tree-sitter grammar packages the target needs, then exit",
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     named_only = args.functions == "named"
     root = Path(args.path).expanduser().resolve()
@@ -1297,12 +1392,7 @@ def main() -> int:
     long_line_files.sort(key=lambda kv: kv[1], reverse=True)
 
     if args.print_requirements:
-        pkgs = sorted(
-            l.grammar.replace("_", "-")
-            for l in LANGS
-            if l.name in present and l.grammar
-        )
-        print(" ".join(pkgs))
+        print(" ".join(grammar_packages(present)))
         return 0
 
     grammars = load_grammars(present)
@@ -1364,52 +1454,20 @@ def main() -> int:
     functions = [f for r in analyzed for f in r.functions]
     anonymous_skipped = sum(r.anonymous for r in analyzed)
 
-    # Granularity: a named callable invoked once is premature reuse (Muratori,
-    # "Semantic Compression"). References are summed across the corpus by name,
-    # so same-name definitions share a count. Zero-use callables are excluded
-    # from the ratio and listed separately: they are entry points, exports, or
-    # dead code, and the metric cannot tell which.
-    references: dict[str, int] = defaultdict(int)
-    for r in analyzed:
-        for ref_name, count in r.references.items():
-            references[ref_name] += count
-    for f in functions:
-        f.uses = references.get(f.name, 0)
-
-    used_functions = [f for f in functions if f.uses >= 1]
-    reused_functions = [f for f in used_functions if f.uses >= 2]
-    single_use_functions = [f for f in used_functions if f.uses == 1]
-    unused_functions = [f for f in functions if f.uses == 0]
-    granularity = (len(single_use_functions) / len(used_functions)) if used_functions else None
-
-    total_mass = sum(f.mass for f in functions)
-    high_mass = sum(f.mass for f in functions if f.cc > HIGH_CC)
-    erosion = high_mass / total_mass if total_mass else None
-    high_cc = [f for f in functions if f.cc > HIGH_CC]
+    # Every metric comes out of one call, so the math is testable on its own.
+    s = compute_signals(functions, analyzed)
+    used_functions, reused_functions = s.used_functions, s.reused_functions
+    single_use_functions, unused_functions = s.single_use_functions, s.unused_functions
+    granularity, erosion, high_cc = s.granularity, s.erosion, s.high_cc
+    total_mass, high_mass = s.total_mass, s.high_mass
 
     total_sloc = sum(r.sloc for r in results)
     # Only parsed, trustworthy files may enter the metrics. An unparsed language
     # would otherwise dilute the denominator and fake a low verbosity.
     metric_sloc = sum(r.sloc for r in analyzed)
 
-    clone_rows: dict[str, set[int]] = defaultdict(set)
-    groups: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
-    for r in analyzed:
-        for digest, start, end in r.clone_candidates:
-            groups[digest].append((r.entry.rel, start, end))
-    for members in groups.values():
-        if len(members) < 2:
-            continue
-        if members[0][2] - members[0][1] + 1 < MIN_CLONE_LINES:
-            continue
-        for rel, start, end in members:
-            clone_rows[rel].update(range(start, end + 1))
-    clone_lines = 0
-    for rel, rows in clone_rows.items():
-        analysis = next((r for r in analyzed if r.entry.rel == rel), None)
-        if analysis is None:
-            continue
-        clone_lines += len({row for row in rows if row not in analysis.comment_rows})
+    clone_lines = s.clone_lines
+    groups = s.groups
     verbosity = clone_lines / metric_sloc if metric_sloc else None
 
     scb, scb_error = run_scb_check(scan_root) if args.scb else (None, None)
@@ -1544,7 +1602,8 @@ def print_report(p: dict) -> None:
 
     if not e["tree_sitter"]:
         print("\n  NOTE: Tree-sitter is unavailable, so no metric below was measured.")
-        print("        Run through scripts/run.sh, which supplies the grammars.")
+        print("        Run through `sloptrack measure`, or the skill's run.sh, which")
+        print("        supply the grammars in a throwaway uvx environment.")
     if e["bundled_files"]:
         shown = ", ".join(e["bundled_files"][:3])
         more = f" (+{len(e['bundled_files']) - 3} more)" if len(e["bundled_files"]) > 3 else ""

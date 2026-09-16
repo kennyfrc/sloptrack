@@ -29,7 +29,8 @@ renamed a node, or a function-name field that is not where the table says.
 
 Run through the wrapper so uvx installs every grammar this file needs:
 
-    scripts/check_languages.sh [--lang NAME] [--verbose]
+    sloptrack check-languages [--lang NAME] [--verbose]
+    ~/.agents/skills/measure-then-fix-slop/scripts/check_languages.sh [flags]
 
 Exit codes: 0 all pass, 1 at least one language failed, 2 at least one grammar
 is not importable (the wrapper could not install it).
@@ -44,9 +45,14 @@ from collections import defaultdict
 from pathlib import Path
 from textwrap import dedent
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import slop_measure as m  # noqa: E402
+try:
+    from . import measure as m
+except ImportError:  # run as a plain script, as an installed skill does
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import slop_measure as m
+    except ImportError:
+        import measure as m  # source checkout, next to the analyzer
 
 # (filename, source, min functions, min CC) per language. Every sample holds a
 # branch and a loop inside a duplicated block, so one fixture proves the
@@ -772,11 +778,11 @@ def check_language(
     return True, detail, analysis
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Verify language vocabularies on known-answer fixtures.")
     ap.add_argument("--lang", action="append", default=[], help="check only this language (repeatable)")
     ap.add_argument("--verbose", action="store_true", help="list every function found per language")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     wanted = args.lang or list(SAMPLES)
     unknown = [name for name in wanted if name not in SAMPLES]
@@ -823,7 +829,7 @@ def main() -> int:
                 print(f"  FAIL  {name:<11} in LANGS but has no fixture in SAMPLES")
             print(f"  {len(unfixtured)} table entr(y/ies) are unverified; add a sample before trusting them")
     if missing:
-        print("  run through scripts/check_languages.sh so uvx installs the grammars")
+        print("  run through `sloptrack check-languages` so uvx installs the grammars")
         return 2
     if failures:
         return 1

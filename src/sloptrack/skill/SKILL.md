@@ -32,6 +32,9 @@ need, so nothing lands in the user's project.
 ~/.agents/skills/measure-then-fix-slop/scripts/run.sh .
 ```
 
+If the `sloptrack` command is installed, `sloptrack measure .` is the same
+measurement: same analyzer, same wrapper, same report. Use whichever is present.
+
 Useful variants:
 
 ```bash
@@ -55,7 +58,9 @@ Useful variants:
 ```
 
 Run plain `python3 scripts/slop_measure.py` only when Tree-sitter is already
-installed. Without it you get SLOC and git growth and nothing else.
+installed. Without it you get SLOC and git growth and nothing else. The path is
+relative to this skill's directory; in a source checkout the same file is
+`src/sloptrack/measure.py`.
 
 The language table is verified with one fixture per language:
 
