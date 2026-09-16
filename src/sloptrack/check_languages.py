@@ -42,6 +42,7 @@ import argparse
 import re
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from textwrap import dedent
 
@@ -615,30 +616,50 @@ USE_CALL_NAMES: dict[str, tuple[str, str]] = {"csharp": ("Alpha", "Beta")}
 # block. Requiring it proves function-level clones fire, not just sub-blocks.
 MIN_FUNCTION_CLONE_SPAN = 6
 
+# What the re-analysis after changing one copy's numbers managed to do.
+LITERAL_OK = "ok"
+LITERAL_NONE = "no-literals"
+LITERAL_ERROR = "error"
 
-def clone_group_count(analysis: m.FileAnalysis) -> int:
-    """Count clone groups the same way the report does."""
+
+def clone_groups(analysis: m.FileAnalysis) -> list[list[tuple[int, int]]]:
+    """Clone groups the report would count, which need two members of clone length."""
     groups: dict[str, list[tuple[int, int]]] = defaultdict(list)
     for digest, start, end in analysis.clone_candidates:
         groups[digest].append((start, end))
-    return sum(
-        1
+    return [
+        members
         for members in groups.values()
         if len(members) >= 2 and members[0][1] - members[0][0] + 1 >= m.MIN_CLONE_LINES
-    )
+    ]
 
 
 def largest_clone_span(analysis: m.FileAnalysis) -> int:
     """Longest span among clone groups with at least two members."""
-    groups: dict[str, list[tuple[int, int]]] = defaultdict(list)
-    for digest, start, end in analysis.clone_candidates:
-        groups[digest].append((start, end))
-    spans = [
-        members[0][1] - members[0][0] + 1
-        for members in groups.values()
-        if len(members) >= 2 and members[0][1] - members[0][0] + 1 >= m.MIN_CLONE_LINES
-    ]
+    spans = (members[0][1] - members[0][0] + 1 for members in clone_groups(analysis))
     return max(spans, default=0)
+
+
+def shortfall(label: str, got: int, want: int, why: str) -> str | None:
+    """A finding when a fixture measured less than it should, else None.
+
+    Returning None rather than a bool is what lets the findings be a list of calls
+    instead of a ladder of append-after-if.
+    """
+    if got >= want:
+        return None
+    return f"{label} {got}, expected >= {want} ({why})"
+
+
+def unexpected(condition: bool, message: str) -> str | None:
+    """A finding when something that should never happen did."""
+    return message if condition else None
+
+
+def analyze_variant(parser, cfg: m.Lang, text: str, filename: str) -> m.FileAnalysis:
+    """Analyze one fixture variant. Raises whatever the grammar or vocabulary raises."""
+    entry = m.FileEntry(path=Path(filename), rel=filename, lang=cfg, text=text)
+    return m.analyze_file(entry, parser, named_only=True)
 
 
 def mutate_first_copy(source: str) -> str:
@@ -660,122 +681,255 @@ def mutate_first_copy(source: str) -> str:
     return "".join(number.sub(bump, line) for line in lines[:half]) + "".join(lines[half:])
 
 
+class FixtureError(RuntimeError):
+    """A fixture could not be analyzed at all."""
+
+
+@dataclass(frozen=True)
+class Fixture:
+    """What one language's fixtures measured, before anyone judges them."""
+
+    name: str
+    cfg: m.Lang
+    filename: str
+    base: m.FileAnalysis
+    min_functions: int
+    min_cc: int
+    mutated_span: int = 0
+    literal_status: str = LITERAL_NONE
+    literal_detail: str = ""
+    call_note: str = ""
+    call_findings: tuple[str, ...] = ()
+
+
+def fixture_parser(name: str, cfg: m.Lang, grammars: dict[str, object]) -> tuple[object | None, str]:
+    """A parser for this fixture, or the reason there cannot be one."""
+    ts_lang = grammars.get(name)
+    if ts_lang is None:
+        package = (cfg.grammar or "?").replace("_", "-")
+        return None, f"MISSING GRAMMAR {cfg.grammar} (pip package: {package})"
+    if cfg.functions == frozenset():
+        return None, "no function node types declared in the LANGS table"
+    try:
+        import tree_sitter
+
+        return tree_sitter.Parser(ts_lang), ""
+    except Exception as exc:  # noqa: BLE001
+        return None, f"parser could not start: {exc}"
+
+
+def syntax_error(parser, source: str) -> bool:
+    """True when the grammar reports an ERROR node for this fixture."""
+    return bool(parser.parse(source.encode("utf-8")).root_node.has_error)
+
+
+def _literal_check(parser, cfg: m.Lang, filename: str, source: str) -> tuple[int, str, str]:
+    """Re-analyze with the first copy's numbers changed. Returns (span, status, detail)."""
+    mutated = mutate_first_copy(source)
+    if mutated == source:
+        return 0, LITERAL_NONE, ""
+    try:
+        span = largest_clone_span(analyze_variant(parser, cfg, mutated, filename))
+    except Exception as exc:  # noqa: BLE001
+        return -1, LITERAL_ERROR, f"re-analyze after literal change raised {type(exc).__name__}: {exc}"
+    return span, LITERAL_OK, ""
+
+
+def _call_check(
+    name: str, cfg: m.Lang, parser, source: str, filename: str
+) -> tuple[str, tuple[str, ...]]:
+    """Count uses on a fixture with known call sites. Returns (note, findings)."""
+    calls = USE_CALLS.get(name)
+    if not calls:
+        return "", ()
+    alpha, beta = USE_CALL_NAMES.get(name, ("alpha", "beta"))
+    try:
+        references = analyze_variant(parser, cfg, source + calls, filename).references
+    except Exception as exc:  # noqa: BLE001
+        return "", (f"use fixture raised {type(exc).__name__}: {exc}",)
+    alpha_uses, beta_uses = references.get(alpha, 0), references.get(beta, 0)
+    findings = [
+        finding
+        for finding in (
+            unexpected(alpha_uses != 1, f"call counting: expected {alpha} called once, got {alpha_uses}"),
+            unexpected(beta_uses < 2, f"call counting: expected {beta} called twice or more, got {beta_uses}"),
+        )
+        if finding is not None
+    ]
+    return f"  uses {alpha} {alpha_uses}/{beta} {beta_uses}", tuple(findings)
+
+
+def run_fixture(name: str, cfg: m.Lang, parser) -> Fixture:
+    """Analyze every variant of one fixture and record what each measured."""
+    filename, source, min_functions, min_cc = SAMPLES[name]
+    try:
+        analysis = analyze_variant(parser, cfg, source, filename)
+    except Exception as exc:  # noqa: BLE001
+        raise FixtureError(f"analyze_file raised {type(exc).__name__}: {exc}") from exc
+    span, status, detail = _literal_check(parser, cfg, filename, source)
+    note, call_findings = _call_check(name, cfg, parser, source, filename)
+    return Fixture(
+        name=name, cfg=cfg, filename=filename, base=analysis,
+        min_functions=min_functions, min_cc=min_cc,
+        mutated_span=span, literal_status=status, literal_detail=detail,
+        call_note=note, call_findings=call_findings,
+    )
+
+
+def worst_cc(fixture: Fixture) -> int:
+    """The highest cyclomatic complexity any function in the fixture reached."""
+    return max((f.cc for f in fixture.base.functions), default=0)
+
+
+def declaration_calls(analysis: m.FileAnalysis) -> dict[str, int]:
+    """Counts attributed to a declaration's own name, which are not uses.
+
+    The base fixture calls none of its functions, so any count here means a
+    declaration or a shadow was read as a use.
+    """
+    return {
+        f.name: analysis.references.get(f.name, 0)
+        for f in analysis.functions
+        if analysis.references.get(f.name, 0)
+    }
+
+
+def blob_name(functions: list[m.Func]) -> str:
+    """The first function whose name looks like a raw text blob, or ""."""
+    for f in functions:
+        if "{" in f.name or "\n" in f.name or len(f.name) > 40:
+            return f.name[:40]
+    return ""
+
+
+def fixture_findings(fixture: Fixture) -> list[str]:
+    """Every reason this fixture failed, in a fixed order."""
+    functions = fixture.base.functions
+    block = fixture.base
+    blob = blob_name(functions)
+    miscounted = declaration_calls(block)
+    candidates = [
+        unexpected(bool(fixture.literal_detail), fixture.literal_detail),
+        unexpected(
+            len(functions) < fixture.min_functions,
+            f"found {len(functions)} named function(s), expected >= {fixture.min_functions}"
+            f" ({block.anonymous} anonymous)",
+        ),
+        shortfall("max CC", worst_cc(fixture), fixture.min_cc, "decision vocabulary missed a branch"),
+        shortfall(
+            "clone group(s)", len(clone_groups(block)), 1,
+            "no clone group fired on the duplicated block",
+        ),
+        shortfall(
+            "largest clone span", largest_clone_span(block), MIN_FUNCTION_CLONE_SPAN,
+            "function-level clones did not fire",
+        ),
+        unexpected(
+            fixture.literal_status == LITERAL_NONE,
+            "no numeric literal in the first copy; the literal check could not run",
+        ),
+        unexpected(
+            fixture.literal_status == LITERAL_OK and fixture.mutated_span < MIN_FUNCTION_CLONE_SPAN,
+            f"after changing one copy's literals, largest clone span {fixture.mutated_span}"
+            f" (expected >= {MIN_FUNCTION_CLONE_SPAN}); literals are not normalized",
+        ),
+        unexpected(bool(blob), f"function name looks like a text blob: {blob!r}"),
+        unexpected(bool(miscounted), f"declaration name(s) counted as calls: {miscounted}"),
+        *fixture.call_findings,
+    ]
+    return [finding for finding in candidates if finding is not None]
+
+
+def fixture_detail(fixture: Fixture) -> str:
+    """The one-line scorecard for a fixture, whether it passed or not."""
+    return (
+        f"functions {len(fixture.base.functions)}  max CC {worst_cc(fixture)}"
+        f"  clones {len(clone_groups(fixture.base))}  span {largest_clone_span(fixture.base)}"
+        f"  lit-span {fixture.mutated_span}  sloc {fixture.base.sloc}{fixture.call_note}"
+    )
+
+
 def check_language(
     name: str, cfg: m.Lang, grammars: dict[str, object]
 ) -> tuple[bool, str, m.FileAnalysis | None]:
     """Run one fixture. Returns (passed, detail, analysis)."""
-    filename, source, min_functions, min_cc = SAMPLES[name]
-    ts_lang = grammars.get(name)
-    if ts_lang is None:
-        pkg = (cfg.grammar or "?").replace("_", "-")
-        return False, f"MISSING GRAMMAR {cfg.grammar} (pip package: {pkg})", None
-    if cfg.functions == frozenset():
-        return False, "no function node types declared in the LANGS table", None
-
-    try:
-        import tree_sitter
-
-        parser = tree_sitter.Parser(ts_lang)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"parser could not start: {exc}", None
-
-    tree = parser.parse(source.encode("utf-8"))
-    if tree.root_node.has_error:
+    parser, problem = fixture_parser(name, cfg, grammars)
+    if parser is None:
+        return False, problem, None
+    if syntax_error(parser, SAMPLES[name][1]):
         return False, "fixture does not parse: grammar reported an ERROR node", None
-
-    entry = m.FileEntry(path=Path(filename), rel=filename, lang=cfg, text=source)
     try:
-        analysis = m.analyze_file(entry, parser, named_only=True)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"analyze_file raised {type(exc).__name__}: {exc}", None
+        fixture = run_fixture(name, cfg, parser)
+    except FixtureError as exc:
+        return False, str(exc), None
+    findings = fixture_findings(fixture)
+    detail = fixture_detail(fixture)
+    if findings:
+        return False, detail + "  |  " + "; ".join(findings), fixture.base
+    return True, detail, fixture.base
 
-    functions = analysis.functions
-    worst = max((f.cc for f in functions), default=0)
-    clones = clone_group_count(analysis)
-    largest = largest_clone_span(analysis)
-    # The base fixture calls none of its functions, so no declared name may have
-    # a counted call. A nonzero value means a declaration or a shadow was read as
-    # a use.
-    declared_names = {f.name for f in functions}
-    miscounted = {
-        call_name: analysis.references.get(call_name, 0)
-        for call_name in declared_names
-        if analysis.references.get(call_name, 0)
-    }
 
-    # A second pass with the first copy's numbers changed. The two bodies now
-    # differ only in literal values, so a matching function-level group proves
-    # the `literals` vocabulary normalizes them.
-    mutated = mutate_first_copy(source)
-    mutated_span = 0
-    mutated_error = ""
-    if mutated != source:
-        mutated_entry = m.FileEntry(path=Path(filename), rel=filename, lang=cfg, text=mutated)
-        try:
-            mutated_analysis = m.analyze_file(mutated_entry, parser, named_only=True)
-            mutated_span = largest_clone_span(mutated_analysis)
-        except Exception as exc:  # noqa: BLE001
-            mutated_span = -1
-            mutated_error = f"re-analyze after literal change raised {type(exc).__name__}: {exc}"
+PASS, FAIL, MISS = "PASS ", "FAIL ", "MISS "
 
-    reasons: list[str] = []
-    if mutated_error:
-        reasons.append(mutated_error)
-    if len(functions) < min_functions:
-        reasons.append(
-            f"found {len(functions)} named function(s), expected >= {min_functions}"
-            f" ({analysis.anonymous} anonymous)"
+USAGE_HINT = "  run through `sloptrack check-languages` so uvx installs the grammars"
+FINAL_NOTE = "  every table entry yields functions, complexity, clones, and call counts on its fixture"
+
+
+def select_languages(wanted: list[str]) -> dict[str, m.Lang]:
+    """Map fixture names to language configs, dropping names with no fixture."""
+    by_name = {lang.name: lang for lang in m.LANGS}
+    return {name: by_name[name] for name in wanted if name in by_name}
+
+
+def selection_problems(wanted: list[str]) -> list[str]:
+    """The error lines that stop a selection, one line per problem."""
+    table = {lang.name for lang in m.LANGS}
+    unfixtured = [name for name in wanted if name not in SAMPLES]
+    untabled = [name for name in wanted if name in SAMPLES and name not in table]
+    problems = []
+    if unfixtured:
+        problems.append(
+            f"error: no fixture for {', '.join(unfixtured)}\n"
+            f"       add one to SAMPLES in {Path(__file__).name}"
         )
-    if worst < min_cc:
-        reasons.append(f"max CC {worst}, expected >= {min_cc} (decision vocabulary missed a branch)")
-    if clones < 1:
-        reasons.append("no clone group fired on the duplicated block")
-    if largest < MIN_FUNCTION_CLONE_SPAN:
-        reasons.append(
-            f"largest clone span {largest}, expected >= {MIN_FUNCTION_CLONE_SPAN}"
-            " (function-level clones did not fire)"
-        )
-    if mutated == source:
-        reasons.append("no numeric literal in the first copy; the literal check could not run")
-    elif mutated_span >= 0 and mutated_span < MIN_FUNCTION_CLONE_SPAN:
-        reasons.append(
-            f"after changing one copy's literals, largest clone span {mutated_span}"
-            f" (expected >= {MIN_FUNCTION_CLONE_SPAN}); literals are not normalized"
-        )
-    bad_name = next(
-        (f for f in functions if "{" in f.name or "\n" in f.name or len(f.name) > 40),
-        None,
-    )
-    if bad_name is not None:
-        reasons.append(f"function name looks like a text blob: {bad_name.name[:40]!r}")
-    if miscounted:
-        reasons.append(f"declaration name(s) counted as calls: {miscounted}")
+    if untabled:
+        problems.append(f"error: {', '.join(untabled)} not in the LANGS table")
+    return problems
 
-    use_note = ""
-    calls = USE_CALLS.get(name)
-    if calls:
-        alpha_name, beta_name = USE_CALL_NAMES.get(name, ("alpha", "beta"))
-        use_entry = m.FileEntry(path=Path(filename), rel=filename, lang=cfg, text=source + calls)
-        try:
-            use_analysis = m.analyze_file(use_entry, parser, named_only=True)
-            refs = use_analysis.references
-            alpha_uses = refs.get(alpha_name, 0)
-            beta_uses = refs.get(beta_name, 0)
-            use_note = f"  uses {alpha_name} {alpha_uses}/{beta_name} {beta_uses}"
-            if alpha_uses != 1:
-                reasons.append(f"call counting: expected {alpha_name} called once, got {alpha_uses}")
-            if beta_uses < 2:
-                reasons.append(f"call counting: expected {beta_name} called twice or more, got {beta_uses}")
-        except Exception as exc:  # noqa: BLE001
-            reasons.append(f"use fixture raised {type(exc).__name__}: {exc}")
 
-    detail = (
-        f"functions {len(functions)}  max CC {worst}  clones {clones}"
-        f"  span {largest}  lit-span {mutated_span}  sloc {analysis.sloc}{use_note}"
-    )
-    if reasons:
-        return False, detail + "  |  " + "; ".join(reasons), analysis
-    return True, detail, analysis
+def report_unverified(names: list[str]) -> int:
+    """Print one line per table entry with no fixture. Returns how many there were."""
+    for name in names:
+        print(f"  {FAIL} {name:<11} in LANGS but has no fixture in SAMPLES")
+    if names:
+        print(f"  {len(names)} table entr(y/ies) are unverified; add a sample before trusting them")
+    return len(names)
+
+
+def report_fixture(name: str, cfg: m.Lang, grammars: dict[str, object], verbose: bool) -> str:
+    """Print one fixture's scorecard. Returns its mark."""
+    passed, detail, analysis = check_language(name, cfg, grammars)
+    if detail.startswith("MISSING"):
+        mark = MISS
+    else:
+        mark = PASS if passed else FAIL
+    print(f"  {mark} {name:<11} {detail}")
+    if verbose and analysis is not None:
+        for f in analysis.functions:
+            print(f"         {f.name:<24} CC {f.cc:<4} SLOC {f.sloc}")
+    return mark
+
+
+def unfixtured_languages() -> list[str]:
+    """Table entries with no fixture, which no run can verify."""
+    return [lang.name for lang in m.LANGS if lang.name not in SAMPLES]
+
+
+def print_requirements(wanted: list[str]) -> int:
+    """Print the grammar packages for these languages, without importing any."""
+    known = {lang.name for lang in m.LANGS}
+    print(" ".join(m.grammar_packages({name for name in wanted if name in known})))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -790,60 +944,28 @@ def main(argv: list[str] | None = None) -> int:
 
     wanted = args.lang or list(SAMPLES)
     if args.print_requirements:
-        # Uses the LANGS table rather than importing the grammars, so a wrapper can
-        # ask which packages to install before they exist.
-        known = {lang.name for lang in m.LANGS}
-        print(" ".join(m.grammar_packages({name for name in wanted if name in known})))
-        return 0
-    unknown = [name for name in wanted if name not in SAMPLES]
-    if unknown:
-        print(f"error: no fixture for {', '.join(unknown)}", file=sys.stderr)
-        print(f"       add one to SAMPLES in {Path(__file__).name}", file=sys.stderr)
-        return 2
-    missing_from_table = [name for name in wanted if name not in {l.name for l in m.LANGS}]
-    if missing_from_table:
-        print(f"error: {', '.join(missing_from_table)} not in the LANGS table", file=sys.stderr)
+        return print_requirements(wanted)
+    problems = selection_problems(wanted)
+    if problems:
+        print("\n".join(problems), file=sys.stderr)
         return 2
 
-    by_name = {l.name: l for l in m.LANGS}
     grammars = m.load_grammars(set(wanted))
-
-    failures = 0
-    missing = 0
+    configs = select_languages(wanted)
     print("LANGUAGE CHECK  fixtures with known answers")
-    for name in wanted:
-        cfg = by_name[name]
-        passed, detail, analysis = check_language(name, cfg, grammars)
-        if detail.startswith("MISSING"):
-            missing += 1
-            mark = "MISS "
-        elif passed:
-            mark = "PASS "
-        else:
-            failures += 1
-            mark = "FAIL "
-        print(f"  {mark} {name:<11} {detail}")
-        if args.verbose and analysis is not None:
-            for f in analysis.functions:
-                print(f"         {f.name:<24} CC {f.cc:<4} SLOC {f.sloc}")
+    marks = [report_fixture(name, configs[name], grammars, args.verbose) for name in wanted]
+    failures = marks.count(FAIL)
+    missing = marks.count(MISS)
+    print(f"\n  {len(wanted) - failures - missing} passed, {failures} failed,"
+          f" {missing} missing grammar(s)")
 
-    total = len(wanted)
-    print(
-        f"\n  {total - failures - missing} passed, {failures} failed, {missing} missing grammar(s)"
-    )
-    if not args.lang:
-        unfixtured = [l.name for l in m.LANGS if l.name not in SAMPLES]
-        if unfixtured:
-            failures += len(unfixtured)
-            for name in unfixtured:
-                print(f"  FAIL  {name:<11} in LANGS but has no fixture in SAMPLES")
-            print(f"  {len(unfixtured)} table entr(y/ies) are unverified; add a sample before trusting them")
+    unverified = 0 if args.lang else report_unverified(unfixtured_languages())
     if missing:
-        print("  run through `sloptrack check-languages` so uvx installs the grammars")
+        print(USAGE_HINT)
         return 2
-    if failures:
+    if failures or unverified:
         return 1
-    print("  every table entry yields functions, complexity, clones, and call counts on its fixture")
+    print(FINAL_NOTE)
     return 0
 
 
