@@ -64,6 +64,61 @@ The paper also reports **cognitive erosion**, which swaps cyclomatic complexity
 for cognitive complexity. Cognitive complexity adds nesting depth, so a deeply
 nested function scores higher than a flat one with the same branch count.
 
+### Granularity: how much of the code is single-use callables
+
+```
+granularity = callables invoked exactly once ÷ callables with at least one call
+```
+
+A use is a call site: `foo()` or `obj.foo()`. A name that is merely mentioned,
+such as a callback passed by name or a local variable that shares the name, is
+not a use, and neither is recursion. Callables with no call site are listed
+separately and kept out of the ratio: they are entry points, public API, or dead
+code, and the metric cannot tell which.
+
+This is the lower bound erosion lacks. A high erosion reading says complexity is
+concentrated; a high granularity reading says the opposite failure, complexity
+scattered into helpers with one caller each. Both are shapes of the same
+problem, and the healthy answer is a band, not a floor. Inlining every
+single-use helper raises erosion and moves the same complexity into its caller.
+
+The rule comes from Casey Muratori's "Semantic Compression" and "Complexity and
+Granularity". His "at least two instances" rule governs reuse, not naming: pull
+out shared code when a second instance appears, but naming a step is legitimate
+at one call. A split is a level of granularity, and it is fine as long as "you
+just don't delete the smaller pieces as you build bigger ones." A single-use
+callable is a candidate to review against that test, not a defect.
+
+The human band was derived the way SlopCodeBench derived its own. The paper
+measures a panel of 48 maintained Python repositories at HEAD, grouped by GitHub
+stars into Niche (<1k), Established (1k-10k), and Major (>10k), with
+documentation and generated code excluded. The same panel was cloned at HEAD and
+measured with the bundled analyzer for granularity. Forty-four of 48 were
+measurable (two names did not resolve to a repository, and two have no Python at
+HEAD):
+
+| Tier | n | Granularity | Erosion (this run) |
+|---|---|---|---|
+| Niche | 6 | 0.47 ± 0.19 | 0.40 ± 0.36 |
+| Established | 11 | 0.24 ± 0.09 | 0.29 ± 0.14 |
+| Major | 27 | 0.24 ± 0.08 | 0.32 ± 0.15 |
+| All | 44 | 0.27 ± 0.13 | 0.32 ± 0.19 |
+
+The erosion column reproduces the paper's panel closely (paper: Niche 0.39,
+Established 0.26, Major 0.31, all 0.31), which is the check that the pipeline
+matches. Granularity has no agent band: SlopCodeBench did not measure it.
+
+Two checks on this table, run later and reproducible:
+
+- **The analyzer reproduces the paper's per-repo erosion.** On 12 panel repos
+  re-measured independently, the bundled analyzer matches Table 7 within 0.01
+  on 11 of them. `click` is the one outlier (this run 0.28, paper 0.34).
+- **The Major tier figure re-measured.** Those 12 repos are all Major tier, and
+  they gave granularity 0.25 ± 0.08 against the 0.24 ± 0.08 recorded above.
+
+Treat the band as approximate to about ±0.05. It is a reference for placing a
+number, not a threshold to certify against.
+
 ## Published baselines
 
 These are population means, not pass/fail lines. Use them to place a number,
@@ -73,6 +128,7 @@ not to grade a repo.
 |---|---|---|
 | Verbosity | 0.15 ± 0.06 | 0.33 ± 0.10 |
 | Erosion | 0.31 ± 0.17 | 0.68 ± 0.20 |
+| Granularity | 0.27 ± 0.13 | not measured |
 
 The author of the linked post also measured his own vibe-coded projects: up to
 0.4 verbosity and 0.75 erosion. Since the two bands overlap, a single reading
@@ -83,6 +139,9 @@ A cleanup turns the human row into a stopping rule rather than a grade: match it
 or sit below it, then stop. `SKILL.md` states the target and the reasoning. The
 numbers still say nothing about whether code is good, and a scope below the
 baseline is a reason to stop working, not a score to defend.
+
+Granularity is the exception. Its row is a band in both directions: below it is
+not an improvement. Read it as "inside the human range", not "under the line".
 
 ## What the benchmark found
 
@@ -407,6 +466,22 @@ genuinely easier to change.
   folds anonymous callbacks into their enclosing function, matching the
   reference. `--functions all` counts every callable instead. The two modes
   will not produce the same erosion, and neither is wrong.
+- **Granularity is name-based and call-site based.** The use count resolves no
+  bindings, so two callables that share a name share their count, and a callback
+  passed by name lands in the zero-use bucket. Treat the single-use list as
+  candidates, not a call graph.
+- **Granularity has no agent band.** SlopCodeBench measured verbosity and
+  erosion, not granularity, so only the human band is grounded in the panel.
+- **Plugin and registry code reads high by construction.** A factory, hook, or
+  command handler is normally wired up at exactly one place, so it is
+  single-use no matter how good the code is. Measured on one extension
+  monorepo, granularity read 0.38 over the whole tree and 0.58 with tests
+  excluded, and most of the rise was wiring plus legitimately named steps.
+  Read a high number on a plugin repo as architecture, and check the names
+  before calling any of it premature.
+- **Granularity counts callables, not types.** Muratori's warning about
+  segregation applies to types too: a base type with one subtype, or a class
+  with one instance, is the same over-abstraction. That is not measured here.
 - **Erosion depends on a threshold.** Moving the CC cutoff moves the score.
   Comparisons are only fair at the same cutoff, which is why 10 is fixed here.
 - **Cross-language averages dilute.** A repo with a handful of enormous files
@@ -429,3 +504,4 @@ genuinely easier to change.
 - Benchmark site and leaderboard: https://www.scbench.ai/
 - Casey Muratori, "Semantic Compression" (2014): https://caseymuratori.com/blog_0015
 - Casey Muratori, "Complexity and Granularity" (2014): https://caseymuratori.com/blog_0016
+- Casey Muratori, "Defining a Single Enumerant" (2014): https://caseymuratori.com/blog_0017

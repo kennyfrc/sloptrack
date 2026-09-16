@@ -75,9 +75,10 @@ treat exit 1 as a failure of the tool.
 ```
 VERBOSITY   0.474   in or above agent band   (3.16x the human baseline)
 EROSION     0.534   between human and agent bands   (1.72x the human baseline)
+GRANULARITY 0.24    within human band   (human 0.27 +/- 0.13)
 ```
 
-Nine lines carry the meaning. Read them before anything else:
+Ten lines carry the meaning. Read them before anything else:
 
 1. **The band, not the raw number.** The human and agent bands overlap, so a
    single mid-range reading proves little. What matters is which band the value
@@ -114,6 +115,12 @@ Nine lines carry the meaning. Read them before anything else:
    literal is not a named callable, and no one is charged for its branches. A
    scope can read clean while a real hotspot sits in that handler. Re-run with
    `--functions all` before you call a scope clean.
+10. **GRANULARITY is a band, not a floor.** It is the share of used callables
+    invoked exactly once, where a use is a call site. Above the band is
+    over-decomposition: helpers with a single caller. Below it is the opposite
+    failure, too few named steps. Do not drive it to zero. Inlining every
+    single-use helper moves the mass back into its caller and raises erosion.
+    The single-use list names candidates, not a work list.
 
 ## Report it
 
@@ -211,6 +218,11 @@ holds it, because a small corpus concentrates its worst function. Set the
 target on the scope you measured, and do not use a repo-wide figure to justify
 more work inside one package.
 
+Granularity is the exception to "lower is better". Its human band is 0.27 +/-
+0.13. Sitting inside it is the goal, and going below it is not an improvement.
+The single-use list names candidates to inline only when the name adds nothing
+and no lower-level route is lost.
+
 1. **Duplicates first.** A duplicate block is proof that the same thing is
    written in more than one place, so compressing it is safe by construction.
    Rank by `saves`, the line count you get back. This order also pays twice:
@@ -273,6 +285,12 @@ so a run cannot quietly substitute "the number fell" for one of them.
    claim rests on a figure.
 10. **Preserve other actors' work.** `git status` first, stage only your own
     paths by explicit path, and do not commit unless asked.
+11. **A single-use callable is a candidate, not a defect.** Muratori's "two
+    instances" rule governs reuse, not naming: pull out shared code when a
+    second instance appears, but naming a step is legitimate at one call.
+    Inline a single-use helper only when the name adds nothing and no
+    lower-level route is lost. Never inline to lower the granularity number;
+    that raises erosion and moves the same complexity into the caller.
 
 `REFERENCE.md` has the two techniques that make a stubborn function tractable,
 the rule for what makes a split legitimate, and the test for when to stop
