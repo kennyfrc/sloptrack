@@ -71,6 +71,31 @@ def _dangling(target: Path) -> bool:
     return target.is_symlink() and not target.resolve().exists()
 
 
+def already_installed(target: Path) -> FileExistsError:
+    """The error for an install that would overwrite one the user already has."""
+    return FileExistsError(f"{target} already exists. Re-run with --force to replace it.")
+
+
+def clear_existing(target: Path, *, force: bool) -> None:
+    """Make room for the install, refusing to replace a live one without force.
+
+    A symlink whose destination is gone is not a live install, so it is replaced
+    without force: that is the state a moved checkout leaves behind.
+    """
+    if _dangling(target):
+        print(f"note: replacing the broken symlink at {target}", file=sys.stderr)
+        target.unlink()
+        return
+    if not target.exists() and not target.is_symlink():
+        return
+    if not force:
+        raise already_installed(target)
+    if target.is_symlink() or target.is_file():
+        target.unlink()
+    else:
+        shutil.rmtree(target)
+
+
 def install(dest_root: str | Path, *, link: bool = False, force: bool = False) -> Install:
     """Install the skill under `dest_root`, replacing an existing one only with force."""
     source = checkout_skill_dir() if link else bundled_skill()
@@ -78,24 +103,7 @@ def install(dest_root: str | Path, *, link: bool = False, force: bool = False) -
         raise RuntimeError(f"skill payload is missing: {source}")
 
     target = Path(dest_root).expanduser() / SKILL_NAME
-    if _dangling(target):
-        # Nothing is installed, so this is not an install to protect. Replacing it
-        # keeps a moved checkout from needing --force.
-        print(f"note: replacing the broken symlink at {target}", file=sys.stderr)
-        target.unlink()
-    elif target.is_symlink() or target.is_file():
-        if not force:
-            raise FileExistsError(
-                f"{target} already exists. Re-run with --force to replace it."
-            )
-        target.unlink()
-    elif target.exists():
-        if not force:
-            raise FileExistsError(
-                f"{target} already exists. Re-run with --force to replace it."
-            )
-        shutil.rmtree(target)
-
+    clear_existing(target, force=force)
     target.parent.mkdir(parents=True, exist_ok=True)
     if link:
         target.symlink_to(source, target_is_directory=True)

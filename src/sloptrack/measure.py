@@ -520,74 +520,99 @@ def git_root(start: Path) -> Path | None:
     return Path(out.stdout.strip()) if out.returncode == 0 and out.stdout.strip() else None
 
 
-def discover(root: Path, excludes: list[str], use_git: bool) -> list[FileEntry]:
-    """Return analyzable files under `root`, honoring .gitignore when in a repo."""
-    root = root.resolve()
-    patterns = [re.compile(_glob_to_regex(g)) for g in excludes]
+def compiled_excludes(excludes: list[str]) -> list[re.Pattern[str]]:
+    """Compile the --exclude globs once, since every candidate path is tested."""
+    return [re.compile(_glob_to_regex(pattern)) for pattern in excludes]
+
+
+def excluded(rel: str, patterns: list[re.Pattern[str]]) -> bool:
+    """True when an --exclude glob matches this scope-relative path."""
+    return any(pattern.search(rel) for pattern in patterns)
+
+
+def lang_for(path: Path) -> Lang | None:
+    """The language a path belongs to, by exact filename first, then extension."""
+    return BY_FILENAME.get(path.name) or BY_EXT.get(path.suffix.lower())
+
+
+def git_entry(repo: Path, root: Path, tracked: str, patterns: list[re.Pattern[str]]) -> FileEntry | None:
+    """One git-listed path as a FileEntry, or None when it is not measurable."""
+    if not tracked:
+        return None
+    path = repo / tracked
+    if path.is_symlink() or not path.is_file():
+        return None
+    resolved = path.resolve()
+    # git lists the whole repository; the scope is `root`.
+    if not resolved.is_relative_to(root):
+        return None
+    if any(part in SKIP_DIRS for part in Path(tracked).parts):
+        return None
+    # Paths are relative to the measured scope, so a report never names directories
+    # the caller did not ask for, and an --exclude glob means the same thing with
+    # and without a subtree.
+    rel = str(resolved.relative_to(root))
+    if excluded(rel, patterns):
+        return None
+    lang = lang_for(path)
+    if lang is None:
+        return None
+    return FileEntry(path, rel, lang)
+
+
+def git_listed(repo: Path, root: Path, patterns: list[re.Pattern[str]]) -> list[FileEntry] | None:
+    """Tracked and untracked files under `root`, or None when git cannot list them."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    entries = [git_entry(repo, root, tracked, patterns) for tracked in out.stdout.split("\0")]
+    return [entry for entry in entries if entry is not None]
+
+
+def tree_walked(root: Path, patterns: list[re.Pattern[str]]) -> list[FileEntry]:
+    """Files found by walking the tree, for when git cannot list them."""
     entries: list[FileEntry] = []
-    seen: set[Path] = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.is_symlink():
+                continue
+            rel = str(path.relative_to(root))
+            if excluded(rel, patterns):
+                continue
+            lang = lang_for(path)
+            if lang is None:
+                continue
+            entries.append(FileEntry(path, rel, lang))
+    return entries
 
-    def lang_for(p: Path) -> Lang | None:
-        return BY_FILENAME.get(p.name) or BY_EXT.get(p.suffix.lower())
 
-    def keep(p: Path, rel: str) -> bool:
-        return not any(rx.search(rel) for rx in patterns)
-
-    repo = git_root(root) if use_git else None
-    if repo is not None:
-        try:
-            out = subprocess.run(
-                ["git", "-C", str(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                capture_output=True, text=True, timeout=60,
-            )
-            if out.returncode == 0:
-                for tracked in out.stdout.split("\0"):
-                    if not tracked:
-                        continue
-                    p = repo / tracked
-                    if p.is_symlink() or not p.is_file():
-                        continue
-                    resolved = p.resolve()
-                    # git lists the whole repository; the scope is `root`.
-                    if not resolved.is_relative_to(root):
-                        continue
-                    if any(part in SKIP_DIRS for part in Path(tracked).parts):
-                        continue
-                    # Paths are relative to the measured scope, so a report never
-                    # names directories the caller did not ask for, and an
-                    # --exclude glob means the same thing with and without a subtree.
-                    rel = str(resolved.relative_to(root))
-                    if not keep(p, rel):
-                        continue
-                    lang = lang_for(p)
-                    if lang is None or p in seen:
-                        continue
-                    seen.add(p)
-                    entries.append(FileEntry(p, rel, lang))
-        except (OSError, subprocess.SubprocessError):
-            repo = None
-
-    if not entries:
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
-            for name in filenames:
-                p = Path(dirpath) / name
-                if p.is_symlink():
-                    continue
-                rel = str(p.relative_to(root))
-                if not keep(p, rel):
-                    continue
-                lang = lang_for(p)
-                if lang is None:
-                    continue
-                entries.append(FileEntry(p, rel, lang))
-
+def read_texts(entries: list[FileEntry]) -> None:
+    """Load each file's text. An unreadable file is left empty rather than fatal."""
     for entry in entries:
         try:
             entry.text = entry.path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             entry.text = ""
-    entries.sort(key=lambda e: e.rel)
+
+
+def discover(root: Path, excludes: list[str], use_git: bool = True) -> list[FileEntry]:
+    """Return analyzable files under `root`, honoring .gitignore when in a repo."""
+    root = root.resolve()
+    patterns = compiled_excludes(excludes)
+    repo = git_root(root) if use_git else None
+    entries = git_listed(repo, root, patterns) if repo is not None else None
+    if not entries:
+        entries = tree_walked(root, patterns)
+    read_texts(entries)
+    entries.sort(key=lambda entry: entry.rel)
     return entries
 
 
@@ -621,6 +646,25 @@ def _glob_to_regex(pattern: str) -> str:
 # --------------------------------------------------------------------------
 
 
+def load_grammar(cfg: Lang, tree_sitter) -> object | None:
+    """Import one grammar and wrap it, or None when it cannot be used.
+
+    A missing package and an ABI mismatch are both ordinary here: a language whose
+    grammar will not load is simply reported as having no grammar.
+    """
+    try:
+        module = __import__(cfg.grammar)
+    except ImportError:
+        return None
+    try:
+        factory = getattr(module, cfg.grammar_fn, None) or getattr(module, "language", None)
+        if factory is None:
+            return None
+        return tree_sitter.Language(factory())
+    except Exception:  # noqa: BLE001 - grammar ABI mismatch is possible
+        return None
+
+
 def load_grammars(langs: set[str]) -> dict[str, object]:
     """Import Tree-sitter languages for `langs`. Returns {} when unavailable."""
     try:
@@ -628,22 +672,13 @@ def load_grammars(langs: set[str]) -> dict[str, object]:
     except ImportError:
         return {}
     loaded: dict[str, object] = {}
-    for lang in sorted(langs):
-        cfg = next((l for l in LANGS if l.name == lang), None)
+    for name in sorted(langs):
+        cfg = next((lang for lang in LANGS if lang.name == name), None)
         if cfg is None or cfg.grammar is None:
             continue
-        try:
-            mod = __import__(cfg.grammar)
-        except ImportError:
-            continue
-        try:
-            factory = getattr(mod, cfg.grammar_fn, None) or getattr(mod, "language", None)
-            if factory is None:
-                continue
-            raw = factory()
-            loaded[lang] = tree_sitter.Language(raw)
-        except Exception:  # noqa: BLE001 - grammar ABI mismatch is possible
-            continue
+        language = load_grammar(cfg, tree_sitter)
+        if language is not None:
+            loaded[name] = language
     return loaded
 
 
@@ -687,17 +722,38 @@ def analyze_file(entry: FileEntry, parser, named_only: bool = True) -> FileAnaly
     cfg = entry.lang
     lines = entry.text.splitlines()
 
+    spans = comment_spans(root, cfg, lines)
+    sloc_lines, comment_rows = sloc_stats(lines, spans)
+    scan = scan_functions(entry, cfg, root, lines, spans, named_only)
+    return FileAnalysis(
+        entry=entry, sloc=sloc_lines, comment_rows=comment_rows,
+        functions=scan.functions, clone_candidates=_clone_candidates(root, cfg),
+        parsed=True, anonymous=scan.anonymous,
+        references=_call_references(root, cfg, scan.declared_ids, scan.self_spans),
+    )
+
+
+def comment_spans(root, cfg: Lang, lines: list[str]) -> dict[int, list[tuple[int, int]]]:
+    """Comment columns per row, which SLOC and clone counting both need."""
     spans: dict[int, list[tuple[int, int]]] = defaultdict(list)
     for node in named_walk(root):
         if node.type not in cfg.comments:
             continue
-        sr, sc = node.start_point
-        er, ec = node.end_point
-        for row in range(sr, er + 1):
-            start = sc if row == sr else 0
-            end = ec if row == er else (len(lines[row]) if row < len(lines) else 0)
+        start_row, start_col = node.start_point
+        end_row, end_col = node.end_point
+        for row in range(start_row, end_row + 1):
+            start = start_col if row == start_row else 0
+            end = end_col if row == end_row else (len(lines[row]) if row < len(lines) else 0)
             spans[row].append((start, end))
+    return spans
 
+
+def sloc_stats(lines: list[str], spans: dict[int, list[tuple[int, int]]]) -> tuple[int, set[int]]:
+    """(SLOC, comment-only rows) for one file.
+
+    A trimmed row of punctuation is not SLOC even though a parser hands it over as
+    a node: counting `}` as code inflates every language by its brace density.
+    """
     comment_rows: set[int] = set()
     sloc_lines = 0
     for idx, raw in enumerate(lines):
@@ -709,19 +765,45 @@ def analyze_file(entry: FileEntry, parser, named_only: bool = True) -> FileAnaly
                 comment_rows.add(idx)
             continue
         sloc_lines += 1
+    return sloc_lines, comment_rows
 
+
+@dataclass
+class FunctionScan:
+    """What the function vocabulary found in one file."""
+
+    functions: list[Func]
+    anonymous: int
+    declared_ids: set[int]
+    self_spans: list[tuple[str, int, int]]
+
+
+def is_callable(node, cfg: Lang) -> bool:
+    """True when this node is a callable the table counts."""
+    if node.type not in cfg.functions:
+        return False
+    if cfg.function_parents and node.parent is not None \
+            and node.parent.type not in cfg.function_parents:
+        return False
+    return not (node.child_by_field_name("body") is None and node.child_count == 0)
+
+
+def scan_functions(
+    entry: FileEntry,
+    cfg: Lang,
+    root,
+    lines: list[str],
+    spans: dict[int, list[tuple[int, int]]],
+    named_only: bool,
+) -> FunctionScan:
+    """Every callable in one file, with the ids and spans the call counter needs."""
     functions: list[Func] = []
     anonymous = 0
     declared_ids: set[int] = set()
     self_spans: list[tuple[str, int, int]] = []
     for node in named_walk(root):
-        if node.type not in cfg.functions:
+        if not is_callable(node, cfg):
             continue
-        if cfg.function_parents and node.parent is not None \
-                and node.parent.type not in cfg.function_parents:
-            continue
-        if node.child_by_field_name("body") is None and node.child_count == 0:
-            continue  # declaration without a body (interface, signature, prototype)
         declared = _func_name_node(node, cfg)
         if declared is not None:
             declared_ids.add(declared.id)
@@ -732,10 +814,9 @@ def analyze_file(entry: FileEntry, parser, named_only: bool = True) -> FileAnaly
             if named_only:
                 continue
         body = node.child_by_field_name("body") or node
-        cc = 1 + _decision_count(body, cfg, fold_nested=named_only)
-        flines = {
-            r for r in range(node.start_point[0], node.end_point[0] + 1)
-            if r < len(lines) and _is_sloc(lines[r], spans.get(r, []))
+        code_lines = {
+            row for row in range(node.start_point[0], node.end_point[0] + 1)
+            if row < len(lines) and _is_sloc(lines[row], spans.get(row, []))
         }
         functions.append(
             Func(
@@ -743,27 +824,11 @@ def analyze_file(entry: FileEntry, parser, named_only: bool = True) -> FileAnaly
                 file=entry.rel,
                 lang=cfg.name,
                 line=node.start_point[0] + 1,
-                cc=cc,
-                sloc=max(1, len(flines)),
+                cc=1 + _decision_count(body, cfg, fold_nested=named_only),
+                sloc=max(1, len(code_lines)),
             )
         )
-
-    candidates = _clone_candidates(root, cfg)
-    references = _call_references(root, cfg, declared_ids, self_spans)
-    return FileAnalysis(
-        entry=entry, sloc=sloc_lines, comment_rows=comment_rows,
-        functions=functions, clone_candidates=candidates, parsed=True,
-        anonymous=anonymous, references=references,
-    )
-
-
-def walk(node):
-    """Pre-order traversal, same shape as scb-check's iter_nodes."""
-    stack = [node]
-    while stack:
-        current = stack.pop()
-        yield current
-        stack.extend(reversed(current.children))
+    return FunctionScan(functions, anonymous, declared_ids, self_spans)
 
 
 def named_walk(node):
@@ -975,16 +1040,26 @@ def _decision_count(node, cfg: Lang, fold_nested: bool = False) -> int:
     stack = [node]
     while stack:
         current = stack.pop()
-        if not fold_nested and current is not node and current.is_named \
-                and current.type in cfg.functions:
+        nested = current.is_named and current.type in cfg.functions
+        if not fold_nested and current is not node and nested:
             continue
-        if current.is_named and current.type in cfg.decisions:
-            total += 1
-        elif current.is_named and current.type in cfg.binary_like \
-                and _has_bool_operator(current, cfg):
+        if counts_as_decision(current, cfg):
             total += 1
         stack.extend(reversed(current.children))
     return total
+
+
+def counts_as_decision(node, cfg: Lang) -> bool:
+    """True when this node is one cyclomatic increment.
+
+    Grammars reuse a keyword's name for the token that spells it, so only named
+    nodes count: an anonymous `if` token would otherwise double every branch.
+    """
+    if not node.is_named:
+        return False
+    if node.type in cfg.decisions:
+        return True
+    return node.type in cfg.binary_like and _has_bool_operator(node, cfg)
 
 
 def _has_bool_operator(node, cfg: Lang) -> bool:
@@ -1155,19 +1230,12 @@ def run_scb_check(root: Path, timeout: int = 900) -> tuple[dict | None, str | No
     Returns (report, error). `error` is set when scb-check was reachable but
     produced nothing usable, so a silent failure never looks like a pass.
     """
-    cmd: list[str] = []
-    if shutil.which("scb-check"):
-        cmd = ["scb-check"]
-    elif shutil.which("uvx"):
-        cmd = [
-            "uvx", "--quiet", "--from", "git+https://github.com/gabeorlanski/scb-check",
-            "scb-check",
-        ]
-    else:
+    command = scb_command()
+    if command is None:
         return None, "neither scb-check nor uvx is on PATH"
     try:
         out = subprocess.run(
-            [*cmd, "check", str(root), "--output-format", "json"],
+            [*command, "check", str(root), "--output-format", "json"],
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -1175,16 +1243,35 @@ def run_scb_check(root: Path, timeout: int = 900) -> tuple[dict | None, str | No
     except (OSError, subprocess.SubprocessError) as exc:
         return None, f"scb-check could not run: {exc}"
 
-    for line in reversed((out.stdout or "").strip().splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                return json.loads(line), None
-            except json.JSONDecodeError:
-                continue
+    report = json_object(out.stdout or "")
+    if report is not None:
+        return report, None
     detail = (out.stderr or "").strip().splitlines()
     tail = detail[-1][:120] if detail else "no output"
     return None, f"scb-check exited {out.returncode} without a JSON report ({tail})"
+
+
+def scb_command() -> list[str] | None:
+    """How to invoke the reference implementation, or None when it is out of reach."""
+    if shutil.which("scb-check"):
+        return ["scb-check"]
+    if shutil.which("uvx"):
+        return [
+            "uvx", "--quiet", "--from", "git+https://github.com/gabeorlanski/scb-check",
+            "scb-check",
+        ]
+    return None
+
+
+def json_object(stdout: str) -> dict | None:
+    """The last JSON object in some output, which is how scb-check reports."""
+    for line in reversed(stdout.strip().splitlines()):
+        if line.strip().startswith("{"):
+            try:
+                return json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -1225,8 +1312,11 @@ def granularity_band(value: float) -> str:
 class Signals:
     """The metric values plus the lists the payload entries are built from."""
 
-    groups: dict[str, list[tuple[str, int, int]]]
+    verbosity: float | None
+    measured_sloc: int
     clone_lines: int
+    groups: dict[str, list[tuple[str, int, int]]]
+    functions: list[Func]
     used_functions: list[Func]
     reused_functions: list[Func]
     single_use_functions: list[Func]
@@ -1238,69 +1328,147 @@ class Signals:
     high_cc: list[Func]
 
 
-def compute_signals(functions: list[Func], analyzed: list[FileAnalysis]) -> Signals:
-    """Compute verbosity's numerator, erosion, and granularity from parsed files.
+@dataclass(frozen=True)
+class MassTotals:
+    """Complexity mass overall, and the part sitting in eroded functions."""
 
-    Takes the functions and the trustworthy file analyses, and returns the values
-    plus the candidate lists the report ranks. Split out of main() so the metric
-    math can be checked without a Tree-sitter grammar.
+    total: float
+    high: float
+    high_cc: list[Func]
+
+    @property
+    def erosion(self) -> float | None:
+        """The share of mass inside functions over the CC cutoff."""
+        return self.high / self.total if self.total else None
+
+
+def use_counts(analyzed: list[FileAnalysis]) -> dict[str, int]:
+    """Call sites summed by callee name across the corpus.
+
+    A named callable invoked once is premature reuse (Muratori, "Semantic
+    Compression"). Counts are summed by name, so same-name definitions share one.
     """
-    # Granularity: a named callable invoked once is premature reuse (Muratori,
-    # "Semantic Compression"). References are summed across the corpus by name,
-    # so same-name definitions share a count. Zero-use callables are excluded
-    # from the ratio and listed separately: they are entry points, exports, or
-    # dead code, and the metric cannot tell which.
-    references: dict[str, int] = defaultdict(int)
-    for r in analyzed:
-        for ref_name, count in r.references.items():
-            references[ref_name] += count
-    for f in functions:
-        f.uses = references.get(f.name, 0)
+    counts: dict[str, int] = defaultdict(int)
+    for result in analyzed:
+        for name, count in result.references.items():
+            counts[name] += count
+    return dict(counts)
 
-    used_functions = [f for f in functions if f.uses >= 1]
-    reused_functions = [f for f in used_functions if f.uses >= 2]
-    single_use_functions = [f for f in used_functions if f.uses == 1]
-    unused_functions = [f for f in functions if f.uses == 0]
-    granularity = (len(single_use_functions) / len(used_functions)) if used_functions else None
 
-    total_mass = sum(f.mass for f in functions)
-    high_mass = sum(f.mass for f in functions if f.cc > HIGH_CC)
-    erosion = high_mass / total_mass if total_mass else None
-    high_cc = [f for f in functions if f.cc > HIGH_CC]
+def apply_uses(functions: list[Func], counts: dict[str, int]) -> None:
+    """Stamp every callable with how many call sites it has."""
+    for func in functions:
+        func.uses = counts.get(func.name, 0)
 
-    # Clone rows: a digest seen in two places marks both spans as duplicate lines.
-    clone_rows: dict[str, set[int]] = defaultdict(set)
+
+def clone_groups_by_digest(analyzed: list[FileAnalysis]) -> dict[str, list[tuple[str, int, int]]]:
+    """Clone candidates grouped by structural hash, across every measured file."""
     groups: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
-    for r in analyzed:
-        for digest, start, end in r.clone_candidates:
-            groups[digest].append((r.entry.rel, start, end))
+    for result in analyzed:
+        for digest, start, end in result.clone_candidates:
+            groups[digest].append((result.entry.rel, start, end))
+    return dict(groups)
+
+
+def is_clone_group(members: list[tuple[str, int, int]]) -> bool:
+    """True when a digest occurs in two places over at least MIN_CLONE_LINES rows."""
+    return len(members) >= 2 and members[0][2] - members[0][1] + 1 >= MIN_CLONE_LINES
+
+
+def duplicate_lines(analyzed: list[FileAnalysis], groups: dict[str, list[tuple[str, int, int]]]) -> int:
+    """Rows that sit in a clone group, with comment rows taken back out.
+
+    A digest seen in two places marks both spans as duplicate lines.
+    """
+    clone_rows: dict[str, set[int]] = defaultdict(set)
     for members in groups.values():
-        if len(members) < 2:
-            continue
-        if members[0][2] - members[0][1] + 1 < MIN_CLONE_LINES:
+        if not is_clone_group(members):
             continue
         for rel, start, end in members:
             clone_rows[rel].update(range(start, end + 1))
-    clone_lines = 0
-    for rel, rows in clone_rows.items():
-        analysis = next((r for r in analyzed if r.entry.rel == rel), None)
-        if analysis is None:
-            continue
-        clone_lines += len({row for row in rows if row not in analysis.comment_rows})
+    comments = {result.entry.rel: result.comment_rows for result in analyzed}
+    return sum(len(rows - comments.get(rel, set())) for rel, rows in clone_rows.items())
 
-    return Signals(
-        groups=groups,
-        clone_lines=clone_lines,
-        used_functions=used_functions,
-        reused_functions=reused_functions,
-        single_use_functions=single_use_functions,
-        unused_functions=unused_functions,
-        granularity=granularity,
-        total_mass=total_mass,
-        high_mass=high_mass,
-        erosion=erosion,
+
+def mass_totals(functions: list[Func]) -> MassTotals:
+    """Complexity mass overall, and the mass in functions over the CC cutoff."""
+    high_cc = [f for f in functions if f.cc > HIGH_CC]
+    return MassTotals(
+        total=sum(f.mass for f in functions),
+        high=sum(f.mass for f in high_cc),
         high_cc=high_cc,
     )
+
+
+def compute_signals(functions: list[Func], analyzed: list[FileAnalysis]) -> Signals:
+    """Compute verbosity's numerator, erosion, and granularity from parsed files.
+
+    Takes the callables and the trustworthy file analyses, and returns the values
+    plus the candidate lists the report ranks. Split out of the pipeline so the
+    metric math can be checked without a Tree-sitter grammar.
+
+    Zero-use callables are excluded from the granularity ratio and listed
+    separately: they are entry points, exports, or dead code, and the metric cannot
+    tell which.
+    """
+    apply_uses(functions, use_counts(analyzed))
+    split = split_by_use(functions)
+    groups = clone_groups_by_digest(analyzed)
+    clone_lines = duplicate_lines(analyzed, groups)
+    sloc = measured_sloc(analyzed)
+    mass = mass_totals(functions)
+    return Signals(
+        verbosity=verbosity_value(clone_lines, sloc),
+        measured_sloc=sloc,
+        clone_lines=clone_lines,
+        groups=groups,
+        functions=functions,
+        used_functions=split.used,
+        reused_functions=split.reused,
+        single_use_functions=split.single_use,
+        unused_functions=split.unused,
+        granularity=split.granularity,
+        total_mass=mass.total,
+        high_mass=mass.high,
+        erosion=mass.erosion,
+        high_cc=mass.high_cc,
+    )
+
+
+@dataclass(frozen=True)
+class UseSplit:
+    """Callables split by how many call sites they have."""
+
+    used: list[Func]
+    reused: list[Func]
+    single_use: list[Func]
+    unused: list[Func]
+
+    @property
+    def granularity(self) -> float | None:
+        """The share of used callables invoked exactly once."""
+        return len(self.single_use) / len(self.used) if self.used else None
+
+
+def split_by_use(functions: list[Func]) -> UseSplit:
+    """Partition callables by use count, which is what granularity measures."""
+    used = [f for f in functions if f.uses >= 1]
+    return UseSplit(
+        used=used,
+        reused=[f for f in used if f.uses >= 2],
+        single_use=[f for f in used if f.uses == 1],
+        unused=[f for f in functions if f.uses == 0],
+    )
+
+
+def measured_sloc(analyzed: list[FileAnalysis]) -> int:
+    """SLOC in the files the metrics trust."""
+    return sum(result.sloc for result in analyzed)
+
+
+def verbosity_value(clone_lines: int, sloc: int) -> float | None:
+    """Duplicated lines per measured SLOC, or None when nothing was parsed."""
+    return clone_lines / sloc if sloc else None
 
 
 def grammar_packages(languages: set[str]) -> list[str]:
@@ -1312,7 +1480,34 @@ def grammar_packages(languages: set[str]) -> list[str]:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def _fallback_sloc(text: str) -> int:
+    """Lines counted without a parse, for files no grammar could read."""
+    return sum(1 for line in text.splitlines() if line.strip())
+
+
+class InputError(RuntimeError):
+    """A request that cannot be measured, with the lines that explain why."""
+
+    def __init__(self, message: str, *hints: str) -> None:
+        super().__init__(message)
+        self.hints = list(hints)
+
+    def lines(self) -> list[str]:
+        """The message and its hints, formatted the way the tool prints them."""
+        return [f"error: {self}", *(f"       {hint}" for hint in self.hints)]
+
+
+@dataclass
+class Target:
+    """What the caller asked to measure: one file, or everything under a root."""
+
+    scope: Path
+    root: Path
+    requested: FileEntry | None = None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The measurement flags. Shared with the CLI, which reads them before measuring."""
     ap = argparse.ArgumentParser(description="Measure code slop (verbosity and structural erosion).")
     ap.add_argument("path", nargs="?", default=".", help="repository or directory to measure")
     ap.add_argument("--json", action="store_true", help="emit JSON instead of a text report")
@@ -1334,97 +1529,141 @@ def main(argv: list[str] | None = None) -> int:
         "--print-requirements", action="store_true",
         help="print the tree-sitter grammar packages the target needs, then exit",
     )
-    args = ap.parse_args(argv)
+    return ap
 
-    named_only = args.functions == "named"
-    root = Path(args.path).expanduser().resolve()
+
+def resolve_target(path: str) -> Target:
+    """Locate the scope, or raise InputError naming what is wrong with the path."""
+    root = Path(path).expanduser().resolve()
     if not root.exists():
-        print(f"error: no such path: {root}", file=sys.stderr)
-        return 2
-    if root.is_file():
-        lang = BY_FILENAME.get(root.name) or BY_EXT.get(root.suffix.lower())
-        if lang is None:
-            print(f"error: unsupported file type: {root.name}", file=sys.stderr)
-            return 2
-        requested = FileEntry(path=root, rel=root.name, lang=lang)
-        try:
-            requested.text = root.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            print(f"error: cannot read {root}: {exc}", file=sys.stderr)
-            return 2
-        scan_dir = root.parent
-    else:
-        requested = None
-        scan_dir = root
+        raise InputError(f"no such path: {root}")
+    if not root.is_file():
+        return Target(scope=root, root=root)
+    lang = BY_FILENAME.get(root.name) or BY_EXT.get(root.suffix.lower())
+    if lang is None:
+        raise InputError(f"unsupported file type: {root.name}")
+    try:
+        text = root.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise InputError(f"cannot read {root}: {exc}")
+    return Target(scope=root, root=root.parent, requested=FileEntry(root, root.name, lang, text))
 
-    scan_root = git_root(scan_dir) or scan_dir
-    # The reported scope is what was asked for, not the repository that holds it:
-    # a subtree run answers a different question from a repository run.
-    scope = requested.path if requested is not None else root
-    if requested is not None:
-        files = [requested]
+
+def parse_request(argv: list[str] | None) -> tuple[argparse.Namespace, Target]:
+    """Flags and scope, decided once, so every stage receives a resolved request."""
+    args = build_parser().parse_args(argv)
+    return args, resolve_target(args.path)
+
+
+def no_files_error(scope: Path) -> InputError:
+    """The error for a scope with nothing measurable in it."""
+    return InputError(
+        f"no recognized source files under {scope}",
+        "recognized: " + " ".join(sorted(BY_EXT)) + " " + " ".join(sorted(BY_FILENAME)),
+        "add the language to LANGS in this script, or run scb-check directly.",
+    )
+
+
+def only_languages(files: list[FileEntry], langs: list[str]) -> list[FileEntry]:
+    """Keep only the files whose language was asked for."""
+    if not langs:
+        return files
+    wanted = set(langs)
+    return [f for f in files if f.lang.name in wanted]
+
+
+def split_bundled(files: list[FileEntry]) -> tuple[list[FileEntry], list[FileEntry]]:
+    """The files to measure and the build artifacts, which are excluded by default.
+
+    A name check decides this, not a line-length guess: a generator's output would
+    otherwise dominate erosion.
+    """
+    bundled = [f for f in files if is_bundled(f)]
+    return [f for f in files if not is_bundled(f)], bundled
+
+
+def select_inputs(
+    target: Target,
+    *,
+    excludes: list[str],
+    langs: list[str],
+    use_git: bool,
+    include_bundled: bool,
+) -> tuple[list[FileEntry], list[FileEntry]]:
+    """The files to measure and the build artifacts left out. Raises InputError when empty."""
+    if target.requested is not None:
+        files = [target.requested]
     else:
-        files = discover(root, args.exclude, use_git=not args.no_git)
-    if args.lang:
-        want = set(args.lang)
-        files = [f for f in files if f.lang.name in want]
+        files = discover(target.root, excludes, use_git=use_git)
+    files = only_languages(files, langs)
     if not files:
-        print(f"error: no recognized source files under {scope}", file=sys.stderr)
-        print("       recognized:", " ".join(sorted(BY_EXT)) + " " + " ".join(sorted(BY_FILENAME)),
-              file=sys.stderr)
-        print("       add the language to LANGS in this script, or run scb-check directly.",
-              file=sys.stderr)
-        return 2
+        raise no_files_error(target.scope)
+    if target.requested is not None or include_bundled:
+        return files, []
+    files, bundled = split_bundled(files)
+    if not files:
+        raise InputError(
+            "every recognized file is named as a build artifact",
+            "pass --include-minified to measure them anyway.",
+        )
+    return files, bundled
 
-    present = {f.lang.name for f in files}
 
-    minified: list[FileEntry] = []
-    if requested is None and not args.include_minified:
-        minified = [f for f in files if is_bundled(f)]
-        if minified:
-            drop = {id(f) for f in minified}
-            files = [f for f in files if id(f) not in drop]
-            if not files:
-                print(
-                    "error: every recognized file is named as a build artifact",
-                    file=sys.stderr,
-                )
-                print("       pass --include-minified to measure them anyway.", file=sys.stderr)
-                return 2
-            present = {f.lang.name for f in files}
+def required_grammars(args: argparse.Namespace, target: Target) -> list[str]:
+    """Grammar packages this request needs, read from the request alone.
 
-    # Long lines suggest generated or templated code, but they are not proof.
-    # Report them so the reader can decide; never exclude on this alone.
-    long_line_files = [
-        (f.rel, long_line_share(f))
-        for f in files
-        if long_line_share(f) >= LONG_LINE_SHARE
-    ]
-    long_line_files.sort(key=lambda kv: kv[1], reverse=True)
+    The CLI asks for this before it measures, so it can install what the run needs
+    without importing a grammar to find out.
+    """
+    files, _bundled = select_inputs(
+        target,
+        excludes=args.exclude,
+        langs=args.lang,
+        use_git=not args.no_git,
+        include_bundled=args.include_minified,
+    )
+    return grammar_packages({f.lang.name for f in files})
 
-    if args.print_requirements:
-        print(" ".join(grammar_packages(present)))
-        return 0
 
-    grammars = load_grammars(present)
-    ts_ok = bool(grammars)
+def long_line_report(files: list[FileEntry]) -> list[tuple[str, float]]:
+    """Files with an unusual share of very long lines, longest share first.
 
-    import_ok = False
-    if ts_ok:
-        try:
-            import tree_sitter
-            import_ok = True
-        except ImportError:
-            ts_ok = False
+    Long lines suggest generated or templated code, but they are not proof. Report
+    them so the reader can decide; never exclude on this alone.
+    """
+    shares = []
+    for entry in files:
+        share = long_line_share(entry)
+        if share >= LONG_LINE_SHARE:
+            shares.append((entry.rel, share))
+    shares.sort(key=lambda pair: pair[1], reverse=True)
+    return shares
 
+
+def load_parsers(grammars: dict[str, object]) -> tuple[dict[str, object], bool]:
+    """A parser per grammar that starts, and whether Tree-sitter imported at all."""
+    try:
+        import tree_sitter
+    except ImportError:
+        return {}, False
     parsers: dict[str, object] = {}
-    if import_ok:
-        for name, ts_lang in grammars.items():
-            try:
-                parsers[name] = tree_sitter.Parser(ts_lang)
-            except Exception:  # noqa: BLE001
-                pass
+    for name, language in grammars.items():
+        try:
+            parsers[name] = tree_sitter.Parser(language)
+        except Exception:  # noqa: BLE001 - a grammar ABI mismatch must not kill the run
+            continue
+    return parsers, True
 
+
+def unparsed(entry: FileEntry) -> FileAnalysis:
+    """A file that still counts for SLOC but contributed no parse."""
+    return FileAnalysis(entry=entry, sloc=_fallback_sloc(entry.text), comment_rows=set())
+
+
+def analyze_files(
+    files: list[FileEntry], parsers: dict[str, object], named_only: bool
+) -> tuple[list[FileAnalysis], dict[str, int]]:
+    """Analyze every file, falling back to SLOC when a parser is missing or fails."""
     results: list[FileAnalysis] = []
     failures: dict[str, int] = defaultdict(int)
     for entry in files:
@@ -1432,306 +1671,520 @@ def main(argv: list[str] | None = None) -> int:
             continue
         parser = parsers.get(entry.lang.name)
         if parser is None:
-            results.append(
-                FileAnalysis(entry=entry, sloc=_fallback_sloc(entry.text), comment_rows=set())
-            )
+            results.append(unparsed(entry))
             continue
         try:
             results.append(analyze_file(entry, parser, named_only=named_only))
         except Exception:  # noqa: BLE001 - a bad grammar must not kill the run
             failures[entry.lang.name] += 1
-            results.append(
-                FileAnalysis(entry=entry, sloc=_fallback_sloc(entry.text), comment_rows=set())
-            )
+            results.append(unparsed(entry))
+    return results, dict(failures)
 
-    # A parsed language that yields no functions at all means the node vocabulary
-    # is wrong for that grammar. Drop it instead of reporting a confident zero.
-    funcs_by_lang: dict[str, int] = defaultdict(int)
-    anon_by_lang: dict[str, int] = defaultdict(int)
-    for r in results:
-        if r.parsed:
-            funcs_by_lang[r.entry.lang.name] += len(r.functions)
-            anon_by_lang[r.entry.lang.name] += r.anonymous
-    # Zero named functions is normal once anonymous callbacks are excluded, so
-    # only a language with no callable at all points at a broken vocabulary.
-    unreliable = {
+
+def unreliable_languages(results: list[FileAnalysis], parsers: dict[str, object]) -> set[str]:
+    """Languages that parsed but yielded no callable at all.
+
+    Zero named functions is normal once anonymous callbacks are excluded, so only a
+    language with no callable of any kind points at a broken vocabulary. Both make
+    for a flattering zero, so neither metric includes them.
+    """
+    named: dict[str, int] = defaultdict(int)
+    anonymous: dict[str, int] = defaultdict(int)
+    for result in results:
+        if result.parsed:
+            named[result.entry.lang.name] += len(result.functions)
+            anonymous[result.entry.lang.name] += result.anonymous
+    return {
         name for name in parsers
-        if funcs_by_lang.get(name, 0) == 0 and anon_by_lang.get(name, 0) == 0
+        if named.get(name, 0) == 0 and anonymous.get(name, 0) == 0
     }
 
-    # Files that were parsed by a grammar whose vocabulary we trust.
-    analyzed = [r for r in results if r.parsed and r.entry.lang.name not in unreliable]
 
-    functions = [f for r in analyzed for f in r.functions]
-    anonymous_skipped = sum(r.anonymous for r in analyzed)
+@dataclass
+class Run:
+    """One measurement, from the resolved request to the numbers the report prints."""
 
-    # Every metric comes out of one call, so the math is testable on its own.
-    s = compute_signals(functions, analyzed)
-    used_functions, reused_functions = s.used_functions, s.reused_functions
-    single_use_functions, unused_functions = s.single_use_functions, s.unused_functions
-    granularity, erosion, high_cc = s.granularity, s.erosion, s.high_cc
-    total_mass, high_mass = s.total_mass, s.high_mass
+    args: argparse.Namespace
+    target: Target
+    scan_root: Path
+    files: list[FileEntry]
+    bundled: list[FileEntry]
+    long_lines: list[tuple[str, float]]
+    present: set[str]
+    grammars: dict[str, object]
+    parsers: dict[str, object]
+    tree_sitter: bool
+    results: list[FileAnalysis]
+    analyzed: list[FileAnalysis]
+    unreliable: set[str]
+    failures: dict[str, int]
+    signals: Signals
+    scb: dict | None
+    scb_error: str | None
+    git: GitStats
 
-    total_sloc = sum(r.sloc for r in results)
+    @property
+    def total_sloc(self) -> int:
+        return sum(result.sloc for result in self.results)
+
+    @property
+    def measured_sloc(self) -> int:
+        return measured_sloc(self.analyzed)
+
+    @property
+    def anonymous_skipped(self) -> int:
+        return sum(result.anonymous for result in self.analyzed)
+
+
+def run_measurement(target: Target, args: argparse.Namespace) -> Run:
+    """Measure the resolved request: discover, parse, then compute the signals."""
+    files, bundled = select_inputs(
+        target,
+        excludes=args.exclude,
+        langs=args.lang,
+        use_git=not args.no_git,
+        include_bundled=args.include_minified,
+    )
+    present = {f.lang.name for f in files}
+    grammars = load_grammars(present)
+    parsers, tree_sitter_available = load_parsers(grammars)
+    results, failures = analyze_files(files, parsers, args.functions == "named")
+    unreliable = unreliable_languages(results, parsers)
     # Only parsed, trustworthy files may enter the metrics. An unparsed language
     # would otherwise dilute the denominator and fake a low verbosity.
-    metric_sloc = sum(r.sloc for r in analyzed)
-
-    clone_lines = s.clone_lines
-    groups = s.groups
-    verbosity = clone_lines / metric_sloc if metric_sloc else None
-
+    analyzed = [r for r in results if r.parsed and r.entry.lang.name not in unreliable]
+    # The git root holds history for the whole repository, even when a subtree is
+    # the scope, so growth and scb-check both run against it.
+    scan_root = git_root(target.root) or target.root
     scb, scb_error = run_scb_check(scan_root) if args.scb else (None, None)
-    scb_coverage = None
-    if scb:
-        scb_loc = scb.get("total_loc") or 0
-        scb_coverage = scb_loc / total_sloc if total_sloc else 0.0
-
     git = GitStats(skip_reason="--no-git") if args.no_git else git_stats(scan_root, args.since)
+    return Run(
+        args=args,
+        target=target,
+        scan_root=scan_root,
+        files=files,
+        bundled=bundled,
+        long_lines=long_line_report(files),
+        present=present,
+        grammars=grammars,
+        parsers=parsers,
+        tree_sitter=bool(grammars) and tree_sitter_available,
+        results=results,
+        analyzed=analyzed,
+        unreliable=unreliable,
+        failures=failures,
+        signals=compute_signals([f for r in analyzed for f in r.functions], analyzed),
+        scb=scb,
+        scb_error=scb_error,
+        git=git,
+    )
 
-    by_lang: dict[str, dict[str, int]] = defaultdict(lambda: {"files": 0, "sloc": 0})
-    for r in results:
-        by_lang[r.entry.lang.name]["files"] += 1
-        by_lang[r.entry.lang.name]["sloc"] += r.sloc
 
-    payload = {
-        "root": str(scope),
-        "engine": {
-            "tree_sitter": ts_ok,
-            "grammars": sorted(grammars),
-            "languages_present": sorted(present),
-            "languages_without_grammar": sorted(present - set(grammars)),
-            "unreliable_languages": sorted(unreliable),
-            "bundled_files": [f.rel for f in minified],
-            "anonymous_skipped": anonymous_skipped,
-            "functions_mode": args.functions,
-            "long_line_files": [{ "file": rel, "share": round(share, 3) }
-                                for rel, share in long_line_files[:10]],
-            "parse_failures": dict(failures),
-            "scb_check": bool(scb),
-            "scb_check_coverage": scb_coverage,
-            "scb_check_error": scb_error,
-        },
-        "sloc": {
-            "total": total_sloc,
-            "measured": metric_sloc,
-            "unmeasured": total_sloc - metric_sloc,
-            "files_total": len(results),
-            "files_measured": len(analyzed),
-            "by_language": {k: dict(v) for k, v in sorted(by_lang.items())},
-        },
-        "verbosity": {
-            "value": verbosity,
-            "clone_lines": clone_lines,
-            "flagged_lines": clone_lines,
-            "ast_grep_lines": (scb or {}).get("ast_grep_flagged_loc"),
-            "band": band(verbosity, "verbosity") if verbosity is not None else None,
-            "vs_human": ratio(verbosity, "verbosity") if verbosity is not None else None,
-        },
-        "erosion": {
-            "value": erosion,
-            "functions": len(functions),
-            "high_cc_functions": len(high_cc),
-            "total_mass": total_mass,
-            "high_cc_mass": high_mass,
-            "anonymous_skipped": anonymous_skipped,
-            "band": band(erosion, "erosion") if erosion is not None else None,
-            "vs_human": ratio(erosion, "erosion") if erosion is not None else None,
-        },
-        "granularity": {
-            "value": granularity,
-            "used_functions": len(used_functions),
-            "reused_functions": len(reused_functions),
-            "single_use_functions": len(single_use_functions),
-            "unused_functions": len(unused_functions),
-            "band": granularity_band(granularity) if granularity is not None else None,
-            "human": BANDS["granularity"]["human"],
-            "human_sd": BANDS["granularity"]["human_sd"],
-            "single_use_top": [
-                {"file": f.file, "line": f.line, "name": f.name, "uses": f.uses,
-                 "cc": f.cc, "sloc": f.sloc}
-                for f in sorted(single_use_functions, key=lambda f: (f.sloc, f.cc), reverse=True)[: args.top]
-            ],
-        },
-        "git": {
-            "available": git.available,
-            "window": git.window,
-            "skip_reason": git.skip_reason,
-            "commits": git.commits,
-            "insertions": git.insertions,
-            "deletions": git.deletions,
-            "delta_loc": git.delta,
-            "total_commits": git.total_commits,
-            "agent_commits": git.agent_commits,
-            "agent_insertions": git.agent_insertions,
-            "largest_commits": git.largest,
-        },
-        "hotspots": [
-            {"file": f.file, "line": f.line, "name": f.name, "cc": f.cc, "sloc": f.sloc}
-            for f in sorted(functions, key=lambda f: f.mass, reverse=True)[: args.top]
-        ],
-        "duplicate_blocks": [
-            {"lines": members[0][2] - members[0][1] + 1,
-             "occurrences": len(members),
-             # Lines freed if the block were compressed into one place.
-             "recoverable_lines": (members[0][2] - members[0][1] + 1) * (len(members) - 1),
-             "locations": [f"{rel}:{start + 1}" for rel, start, _ in members[:DUPLICATE_LOCATIONS]]}
-            for members in sorted(
-                (m for m in groups.values() if len(m) >= 2 and m[0][2] - m[0][1] + 1 >= MIN_CLONE_LINES),
-                key=lambda m: (m[0][2] - m[0][1] + 1) * (len(m) - 1),
-                reverse=True,
-            )[: args.top]
-        ],
-        "scb_check": scb,
+def band_fields(value: float | None, kind: str) -> dict:
+    """The band a value lands in and its multiple of the human baseline.
+
+    One place pairs a value with its band, so a reading cannot carry a stale band.
+    """
+    return {
+        "band": band(value, kind) if value is not None else None,
+        "vs_human": ratio(value, kind) if value is not None else None,
     }
 
+
+def scb_coverage(run: Run) -> float | None:
+    """How much of this repo's SLOC the reference implementation could see."""
+    if not run.scb:
+        return None
+    scanned = run.scb.get("total_loc") or 0
+    return scanned / run.total_sloc if run.total_sloc else 0.0
+
+
+def language_sloc(results: list[FileAnalysis]) -> dict[str, dict[str, int]]:
+    """File and SLOC counts per language, for the header line and the JSON."""
+    by_lang: dict[str, dict[str, int]] = defaultdict(lambda: {"files": 0, "sloc": 0})
+    for result in results:
+        entry = by_lang[result.entry.lang.name]
+        entry["files"] += 1
+        entry["sloc"] += result.sloc
+    return {name: dict(counts) for name, counts in sorted(by_lang.items())}
+
+
+def engine_payload(run: Run) -> dict:
+    """What the engine saw: grammars, exclusions, and what it could not parse."""
+    return {
+        "tree_sitter": run.tree_sitter,
+        "grammars": sorted(run.grammars),
+        "languages_present": sorted(run.present),
+        "languages_without_grammar": sorted(run.present - set(run.grammars)),
+        "unreliable_languages": sorted(run.unreliable),
+        "bundled_files": [f.rel for f in run.bundled],
+        "anonymous_skipped": run.anonymous_skipped,
+        "functions_mode": run.args.functions,
+        "long_line_files": [
+            {"file": rel, "share": round(share, 3)} for rel, share in run.long_lines[:10]
+        ],
+        "parse_failures": run.failures,
+        "scb_check": bool(run.scb),
+        "scb_check_coverage": scb_coverage(run),
+        "scb_check_error": run.scb_error,
+    }
+
+
+def sloc_payload(run: Run) -> dict:
+    """Line counts: total, measured, and the difference the metrics ignore."""
+    return {
+        "total": run.total_sloc,
+        "measured": run.measured_sloc,
+        "unmeasured": run.total_sloc - run.measured_sloc,
+        "files_total": len(run.results),
+        "files_measured": len(run.analyzed),
+        "by_language": language_sloc(run.results),
+    }
+
+
+def verbosity_payload(run: Run) -> dict:
+    """Duplicated lines over measured SLOC, next to the reference figure."""
+    value = run.signals.verbosity
+    return {
+        "value": value,
+        "clone_lines": run.signals.clone_lines,
+        "flagged_lines": run.signals.clone_lines,
+        "ast_grep_lines": (run.scb or {}).get("ast_grep_flagged_loc"),
+        **band_fields(value, "verbosity"),
+    }
+
+
+def erosion_payload(run: Run) -> dict:
+    """Complexity mass above the CC cutoff over all complexity mass."""
+    value = run.signals.erosion
+    return {
+        "value": value,
+        "functions": len(run.signals.functions),
+        "high_cc_functions": len(run.signals.high_cc),
+        "total_mass": run.signals.total_mass,
+        "high_cc_mass": run.signals.high_mass,
+        "anonymous_skipped": run.anonymous_skipped,
+        **band_fields(value, "erosion"),
+    }
+
+
+def granularity_payload(run: Run) -> dict:
+    """The share of used callables with exactly one call site, plus its band."""
+    signals = run.signals
+    value = signals.granularity
+    return {
+        "value": value,
+        "used_functions": len(signals.used_functions),
+        "reused_functions": len(signals.reused_functions),
+        "single_use_functions": len(signals.single_use_functions),
+        "unused_functions": len(signals.unused_functions),
+        "band": granularity_band(value) if value is not None else None,
+        "human": BANDS["granularity"]["human"],
+        "human_sd": BANDS["granularity"]["human_sd"],
+        "single_use_top": [
+            func_entry(f, with_uses=True) for f in rank_by(signals.single_use_functions, run.args.top)
+        ],
+    }
+
+
+def func_entry(func: Func, *, with_uses: bool = False) -> dict:
+    """One callable, as the hotspot and single-use lists report it."""
+    entry = {
+        "file": func.file, "line": func.line, "name": func.name,
+    }
+    if with_uses:
+        entry["uses"] = func.uses
+    entry.update({"cc": func.cc, "sloc": func.sloc})
+    return entry
+
+
+def rank_by(functions: list[Func], top: int) -> list[Func]:
+    """The heaviest callables first, which is the order every list uses."""
+    return sorted(functions, key=lambda f: f.mass, reverse=True)[:top]
+
+
+def duplicate_payload(run: Run) -> list[dict]:
+    """Clone groups worth compressing, largest saving first."""
+    groups = (m for m in run.signals.groups.values() if is_clone_group(m))
+    ranked = sorted(groups, key=lambda m: (m[0][2] - m[0][1] + 1) * (len(m) - 1), reverse=True)
+    return [
+        {
+            "lines": members[0][2] - members[0][1] + 1,
+            "occurrences": len(members),
+            # Lines freed if the block were compressed into one place.
+            "recoverable_lines": (members[0][2] - members[0][1] + 1) * (len(members) - 1),
+            "locations": [f"{rel}:{start + 1}" for rel, start, _ in members[:DUPLICATE_LOCATIONS]],
+        }
+        for members in ranked[: run.args.top]
+    ]
+
+
+def git_payload(git: GitStats) -> dict:
+    """Growth over the window, and the commits that carried an agent trailer."""
+    return {
+        "available": git.available,
+        "window": git.window,
+        "skip_reason": git.skip_reason,
+        "commits": git.commits,
+        "insertions": git.insertions,
+        "deletions": git.deletions,
+        "delta_loc": git.delta,
+        "total_commits": git.total_commits,
+        "agent_commits": git.agent_commits,
+        "agent_insertions": git.agent_insertions,
+        "largest_commits": git.largest,
+    }
+
+
+def build_payload(run: Run) -> dict:
+    """The JSON report: every number the text report prints, plus the lists behind them."""
+    return {
+        "root": str(run.target.scope),
+        "engine": engine_payload(run),
+        "sloc": sloc_payload(run),
+        "verbosity": verbosity_payload(run),
+        "erosion": erosion_payload(run),
+        "granularity": granularity_payload(run),
+        "git": git_payload(run.git),
+        "hotspots": [func_entry(f) for f in rank_by(run.signals.functions, run.args.top)],
+        "duplicate_blocks": duplicate_payload(run),
+        "scb_check": run.scb,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Measure one request and write its report."""
+    try:
+        args, target = parse_request(argv)
+        if args.print_requirements:
+            print(" ".join(required_grammars(args, target)))
+            return 0
+        run = run_measurement(target, args)
+    except InputError as exc:
+        print("\n".join(exc.lines()), file=sys.stderr)
+        return 2
+
+    payload = build_payload(run)
     if args.json:
         print(json.dumps(payload, indent=2, default=str))
         return 0
-
     print_report(payload)
+    erosion = run.signals.erosion
     return 1 if (erosion is not None and erosion > BANDS["erosion"]["agent"]) else 0
 
 
-def _fallback_sloc(text: str) -> int:
-    return sum(1 for line in text.splitlines() if line.strip())
+def print_metric_row(label: str, value: float | None, band_name: str = "", detail: str = "",
+                     unavailable: str = "") -> None:
+    """One metric, its band, and its multiple of human. Or why it is not there."""
+    if value is None:
+        print(f"  {label:<12}n/a{unavailable}")
+        return
+    print(f"  {label:<12}{value:.3f}   {band_name}   ({detail})")
 
 
-def print_report(p: dict) -> None:
-    e = p["engine"]
-    print(f"SLOP REPORT  {p['root']}")
-    langs = ", ".join(
-        f"{k} {v['files']}f/{v['sloc']}sloc" for k, v in p["sloc"]["by_language"].items()
+def print_metric_detail(text: str) -> None:
+    """The indented line under a metric that carries its detail."""
+    print(f"              {text}")
+
+
+def print_inputs(p: dict) -> None:
+    """The header: what was measured, and how many lines it came to."""
+    languages = ", ".join(
+        f"{name} {counts['files']}f/{counts['sloc']}sloc"
+        for name, counts in p["sloc"]["by_language"].items()
     )
-    print(f"  languages      {langs}")
-    sl = p["sloc"]
-    if sl["unmeasured"]:
-        print(f"  total SLOC     {sl['total']}  ({sl['measured']} measured,"
-              f" {sl['unmeasured']} excluded)")
+    print(f"  languages      {languages}")
+    sloc = p["sloc"]
+    if sloc["unmeasured"]:
+        print(f"  total SLOC     {sloc['total']}  ({sloc['measured']} measured,"
+              f" {sloc['unmeasured']} excluded)")
     else:
-        print(f"  total SLOC     {sl['total']}")
+        print(f"  total SLOC     {sloc['total']}")
 
-    if not e["tree_sitter"]:
+
+def print_engine_notes(engine: dict) -> None:
+    """Everything a reader has to know before trusting a number below."""
+    if not engine["tree_sitter"]:
         print("\n  NOTE: Tree-sitter is unavailable, so no metric below was measured.")
         print("        Run through `sloptrack measure`, or the skill's run.sh, which")
         print("        supply the grammars in a throwaway uvx environment.")
-    if e["bundled_files"]:
-        shown = ", ".join(e["bundled_files"][:3])
-        more = f" (+{len(e['bundled_files']) - 3} more)" if len(e["bundled_files"]) > 3 else ""
-        print(f"  excluded {len(e['bundled_files'])} build artifact(s): {shown}{more}")
+    if engine["bundled_files"]:
+        shown = ", ".join(engine["bundled_files"][:3])
+        extra = len(engine["bundled_files"]) - 3
+        more = f" (+{extra} more)" if extra > 0 else ""
+        print(f"  excluded {len(engine['bundled_files'])} build artifact(s): {shown}{more}")
         print("           Generators are excluded so they do not dominate erosion.")
         print("           Pass --include-minified to measure them anyway.")
-    if e["long_line_files"]:
-        top = e["long_line_files"][:3]
-        shown = ", ".join(f"{d['file']} ({d['share']:.0%})" for d in top)
-        print(f"  note: {len(e['long_line_files'])} file(s) have many long lines: {shown}")
+    if engine["long_line_files"]:
+        shown = ", ".join(
+            f"{d['file']} ({d['share']:.0%})" for d in engine["long_line_files"][:3]
+        )
+        print(f"  note: {len(engine['long_line_files'])} file(s) have many long lines: {shown}")
         print("        Generated or templated code can inflate erosion. Check before")
         print("        trusting their numbers; --exclude them if they are not yours.")
-    if e["languages_without_grammar"]:
-        print(f"  no grammar for {', '.join(e['languages_without_grammar'])};"
+    if engine["languages_without_grammar"]:
+        print(f"  no grammar for {', '.join(engine['languages_without_grammar'])};"
               " excluded from both metrics")
-    if e["unreliable_languages"]:
-        print(f"  EXCLUDED {', '.join(e['unreliable_languages'])}: parsed, but found no"
+    if engine["unreliable_languages"]:
+        print(f"  EXCLUDED {', '.join(engine['unreliable_languages'])}: parsed, but found no"
               " functions.")
         print("           Either the node vocabulary is wrong for that grammar, or the")
         print("           files are not valid in the language their extension claims.")
         print("           Both make for a flattering zero, so neither metric includes them.")
-    if e["parse_failures"]:
-        print(f"  parse failures {e['parse_failures']}")
+    if engine["parse_failures"]:
+        print(f"  parse failures {engine['parse_failures']}")
 
-    print()
+
+def print_verbosity(p: dict) -> None:
     v = p["verbosity"]
-    if v["value"] is not None:
-        print(f"  VERBOSITY   {v['value']:.3f}   {v['band']}   ({v['vs_human']})")
-        print(f"              clone lines {v['clone_lines']} of {sl['measured']} SLOC"
-              f"   [human 0.15 +/- 0.06 | agent 0.33 +/- 0.10]")
-        if v.get("ast_grep_lines") is None:
-            print("              clone component only. The published metric also counts")
-            print("              ast-grep drops, so treat this as a lower bound.")
-    else:
-        print("  VERBOSITY   n/a   nothing was parsed, so there is no denominator")
+    print_metric_row(
+        "VERBOSITY", v["value"], v["band"], v["vs_human"],
+        "   nothing was parsed, so there is no denominator",
+    )
+    if v["value"] is None:
+        return
+    print_metric_detail(
+        f"clone lines {v['clone_lines']} of {p['sloc']['measured']} SLOC"
+        "   [human 0.15 +/- 0.06 | agent 0.33 +/- 0.10]"
+    )
+    if v.get("ast_grep_lines") is None:
+        print("              clone component only. The published metric also counts")
+        print("              ast-grep drops, so treat this as a lower bound.")
 
-    er = p["erosion"]
-    if er["value"] is not None:
-        print(f"  EROSION     {er['value']:.3f}   {er['band']}   ({er['vs_human']})")
-        print(f"              {er['high_cc_functions']} of {er['functions']} functions have CC > {HIGH_CC}"
-              f"   [human 0.31 +/- 0.17 | agent 0.68 +/- 0.20]")
-        if er.get("anonymous_skipped"):
-            print(f"              {er['anonymous_skipped']} anonymous callable(s) not counted;"
-                  " use --functions all to include them")
-    else:
-        print("  EROSION     n/a (no functions parsed)")
 
-    gr = p["granularity"]
-    if gr["value"] is not None:
-        print(f"  GRANULARITY {gr['value']:.3f}   {gr['band']}"
-              f"   (human {gr['human']:.2f} +/- {gr['human_sd']:.2f})")
-        print(f"              {gr['single_use_functions']} of {gr['used_functions']} used callables invoked"
-              f" once; {gr['reused_functions']} invoked twice or more")
-        if gr["unused_functions"]:
-            print(f"              {gr['unused_functions']} callable(s) have no call site"
-                  " (entry points, public API, or dead code)")
-    else:
-        print("  GRANULARITY n/a (no callable has a counted reference)")
+def print_erosion(p: dict) -> None:
+    e = p["erosion"]
+    print_metric_row("EROSION", e["value"], e["band"], e["vs_human"], " (no functions parsed)")
+    if e["value"] is None:
+        return
+    print_metric_detail(
+        f"{e['high_cc_functions']} of {e['functions']} functions have CC > {HIGH_CC}"
+        "   [human 0.31 +/- 0.17 | agent 0.68 +/- 0.20]"
+    )
+    if e.get("anonymous_skipped"):
+        print_metric_detail(
+            f"{e['anonymous_skipped']} anonymous callable(s) not counted;"
+            " use --functions all to include them"
+        )
 
-    g = p["git"]
+
+def print_granularity(p: dict) -> None:
+    g = p["granularity"]
+    print_metric_row(
+        "GRANULARITY", g["value"], g["band"],
+        f"human {g['human']:.2f} +/- {g['human_sd']:.2f}",
+        " (no callable has a counted reference)",
+    )
+    if g["value"] is None:
+        return
+    print_metric_detail(
+        f"{g['single_use_functions']} of {g['used_functions']} used callables invoked"
+        f" once; {g['reused_functions']} invoked twice or more"
+    )
+    if g["unused_functions"]:
+        print_metric_detail(
+            f"{g['unused_functions']} callable(s) have no call site"
+            " (entry points, public API, or dead code)"
+        )
+
+
+def print_metrics(p: dict) -> None:
+    """The three metrics, in the order the bands are documented."""
+    print_verbosity(p)
+    print_erosion(p)
+    print_granularity(p)
+
+
+def print_growth(p: dict) -> None:
+    """Line growth over the window, and whatever agent trailers were found."""
+    git = p["git"]
     print()
-    if g["available"]:
-        print(f"  GROWTH      {g['delta_loc']:+d} LOC over '{g['window']}'"
-              f"  (+{g['insertions']} / -{g['deletions']} in {g['commits']} commits)")
-        if g["agent_commits"]:
-            share = g["agent_insertions"] / g["insertions"] if g["insertions"] else 0
-            print(f"  AGENT TRAILER  {g['agent_commits']} commits carried an agent trailer,"
-                  f" +{g['agent_insertions']} lines ({share:.0%} of insertions)")
-    else:
-        reason = g["skip_reason"]
-        if reason:
-            print(f"  GROWTH      skipped ({reason})")
-        else:
-            print("  GROWTH      not a git repository; skipped")
+    if not git["available"]:
+        reason = git["skip_reason"]
+        print(f"  GROWTH      skipped ({reason})" if reason
+              else "  GROWTH      not a git repository; skipped")
+        return
+    print(f"  GROWTH      {git['delta_loc']:+d} LOC over '{git['window']}'"
+          f"  (+{git['insertions']} / -{git['deletions']} in {git['commits']} commits)")
+    if git["agent_commits"]:
+        share = git["agent_insertions"] / git["insertions"] if git["insertions"] else 0
+        print(f"  AGENT TRAILER  {git['agent_commits']} commits carried an agent trailer,"
+              f" +{git['agent_insertions']} lines ({share:.0%} of insertions)")
 
-    if p["scb_check"]:
-        s = p["scb_check"]
-        cov = e["scb_check_coverage"]
-        print()
-        if s.get("total_loc"):
-            print(f"  scb-check   verbosity {s.get('verbosity', 0):.3f}"
-                  f"  erosion {s.get('erosion', 0):.3f}"
-                  f"  cog_erosion {s.get('cog_erosion', 0):.3f}")
-            print(f"              scanned {s.get('total_loc', 0)} SLOC"
-                  + (f" ({cov:.0%} of this repo's SLOC)" if cov is not None else ""))
-            if cov is not None and cov < 0.6:
-                print("              WARNING: scb-check saw under 60% of this repo, so its score")
-                print("                       describes the files it can parse, not the codebase.")
-        else:
-            print("  scb-check   ran, but the repo has no files in a language it can parse.")
-    elif e.get("scb_check_error"):
-        print(f"\n  scb-check   FAILED: {e['scb_check_error']}")
-    elif set(p["engine"]["languages_present"]) & SCB_CHECK_SUPPORTED:
-        langs = ", ".join(sorted(set(p["engine"]["languages_present"]) & SCB_CHECK_SUPPORTED))
-        print(f"\n  hint: scb-check covers {langs}. Re-run with --scb for the reference")
-        print("        implementation's composites, which include the ast-grep rules.")
 
-    if p["hotspots"]:
-        print("\n  WORST FUNCTIONS BY MASS (CC > 10 = eroded)")
-        for f in p["hotspots"]:
-            flag = "  <-- eroded" if f["cc"] > HIGH_CC else ""
-            print(f"    CC {f['cc']:>4}  {f['sloc']:>5} sloc  {f['file']}:{f['line']}"
-                  f"  {f['name']}{flag}")
+def print_scb_check(p: dict) -> None:
+    """The reference implementation's numbers, when it ran or was asked for."""
+    engine = p["engine"]
+    report = p["scb_check"]
+    if not report:
+        if engine.get("scb_check_error"):
+            print(f"\n  scb-check   FAILED: {engine['scb_check_error']}")
+        elif set(engine["languages_present"]) & SCB_CHECK_SUPPORTED:
+            langs = ", ".join(sorted(set(engine["languages_present"]) & SCB_CHECK_SUPPORTED))
+            print(f"\n  hint: scb-check covers {langs}. Re-run with --scb for the reference")
+            print("        implementation's composites, which include the ast-grep rules.")
+        return
+    coverage = engine["scb_check_coverage"]
+    print()
+    if not report.get("total_loc"):
+        print("  scb-check   ran, but the repo has no files in a language it can parse.")
+        return
+    print(f"  scb-check   verbosity {report.get('verbosity', 0):.3f}"
+          f"  erosion {report.get('erosion', 0):.3f}"
+          f"  cog_erosion {report.get('cog_erosion', 0):.3f}")
+    covered = f" ({coverage:.0%} of this repo's SLOC)" if coverage is not None else ""
+    print(f"              scanned {report.get('total_loc', 0)} SLOC{covered}")
+    if coverage is not None and coverage < 0.6:
+        print("              WARNING: scb-check saw under 60% of this repo, so its score")
+        print("                       describes the files it can parse, not the codebase.")
 
-    if p["duplicate_blocks"]:
-        print("\n  DUPLICATE BLOCKS (a second instance is the signal to compress)")
-        for b in p["duplicate_blocks"]:
-            shown = " | ".join(b["locations"])
-            more = b["occurrences"] - len(b["locations"])
-            more = f" (+{more} more)" if more > 0 else ""
-            print(f"    {b['lines']:>4} lines x{b['occurrences']}, saves {b['recoverable_lines']:>4}  {shown}{more}")
 
-    if p["granularity"]["single_use_top"]:
-        print("\n  SINGLE-USE CALLABLES (invoked once; inline it unless it names a step)")
-        for f in p["granularity"]["single_use_top"]:
-            print(f"    {f['sloc']:>5} sloc  CC {f['cc']:<3}  {f['file']}:{f['line']}  {f['name']}"
-                  f"  (uses {f['uses']})")
+def print_hotspots(p: dict) -> None:
+    """The heaviest functions, flagged when complexity is over the cutoff."""
+    if not p["hotspots"]:
+        return
+    print(f"\n  WORST FUNCTIONS BY MASS (CC > {HIGH_CC} = eroded)")
+    for f in p["hotspots"]:
+        flag = "  <-- eroded" if f["cc"] > HIGH_CC else ""
+        print(f"    CC {f['cc']:>4}  {f['sloc']:>5} sloc  {f['file']}:{f['line']}"
+              f"  {f['name']}{flag}")
+
+
+def print_duplicates(p: dict) -> None:
+    """Cloned blocks, by how many lines compressing them would free."""
+    if not p["duplicate_blocks"]:
+        return
+    print("\n  DUPLICATE BLOCKS (a second instance is the signal to compress)")
+    for block in p["duplicate_blocks"]:
+        shown = " | ".join(block["locations"])
+        extra = block["occurrences"] - len(block["locations"])
+        more = f" (+{extra} more)" if extra > 0 else ""
+        print(f"    {block['lines']:>4} lines x{block['occurrences']},"
+              f" saves {block['recoverable_lines']:>4}  {shown}{more}")
+
+
+def print_single_use(p: dict) -> None:
+    """Callables with one call site, which is where granularity comes from."""
+    if not p["granularity"]["single_use_top"]:
+        return
+    print("\n  SINGLE-USE CALLABLES (invoked once; inline it unless it names a step)")
+    for f in p["granularity"]["single_use_top"]:
+        print(f"    {f['sloc']:>5} sloc  CC {f['cc']:<3}  {f['file']}:{f['line']}  {f['name']}"
+              f"  (uses {f['uses']})")
+
+
+def print_report(p: dict) -> None:
+    """The text report: the same numbers as the JSON, in reading order."""
+    print(f"SLOP REPORT  {p['root']}")
+    print_inputs(p)
+    print_engine_notes(p["engine"])
+    print()
+    print_metrics(p)
+    print_growth(p)
+    print_scb_check(p)
+    print_hotspots(p)
+    print_duplicates(p)
+    print_single_use(p)
 
 
 if __name__ == "__main__":
