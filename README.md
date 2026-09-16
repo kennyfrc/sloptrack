@@ -63,9 +63,9 @@ sloptrack check-languages                # verify every grammar against a known-
 The report places each number against its band and names the offenders:
 
 ```
-VERBOSITY   0.474   in or above agent band   (3.16x the human baseline)
+VERBOSITY   0.474   in or above agent band   (3.16x the reference)
             clone lines 36 of 76 SLOC   [human 0.15 +/- 0.06 | agent 0.33 +/- 0.10]
-EROSION     0.534   between human and agent bands   (1.72x the human baseline)
+EROSION     0.534   between human and agent bands   (1.72x the reference)
             1 of 12 functions have CC > 10   [human 0.31 +/- 0.17 | agent 0.68 +/- 0.20]
 GRANULARITY 0.240   within human band   (human 0.27 +/- 0.13)
             6 of 25 used callables invoked once; 19 invoked twice or more
@@ -75,8 +75,18 @@ Exit `0` means a normal run. Exit `1` means erosion above the agent band, which
 is a reading and not a tool failure. Exit `2` means bad input. Exit `3` means
 coverage below 60%, so too little of the repo parsed to judge it: the report
 names the files it skipped and refuses to place a number in a band. C projects
-tend to land here, because tree-sitter-c cannot represent `#if` inside an
-initializer or a declaration.
+land here when a file needs its build configuration. C and C++ are read by
+clang, so a file that will not compile has no structure to measure: run the
+project's configure step and export `compile_commands.json`, or write the flags
+into `.sloptrack-cflags`.
+
+Each number is placed against a panel, and the report names which one. Python and
+most other languages use the published SlopCodeBench panel. A C or C++ repo is
+read against its own panel: 11 maintained C repositories, measured whole-tree for
+this project. C erosion and granularity both run higher than Python's, by nature.
+Long switch-driven functions are ordinary in C, and so are single-caller `static`
+helpers. The numbers, the commits, and the coverage of every repo in that panel
+are in `REFERENCE.md`.
 
 There is also an agent skill. Installed, the skill turns a measurement into a
 report and a set of fixes. Invoke it as a slash command:

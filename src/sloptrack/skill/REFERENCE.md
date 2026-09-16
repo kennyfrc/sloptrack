@@ -145,35 +145,73 @@ not an improvement. Read it as "inside the human range", not "under the line".
 
 ## Measured reference numbers
 
-Seven open-source repos measured whole-tree, to check that the bands behave on
-code nobody wrote for a benchmark. Coverage is the share of non-blank lines that
-reached the metrics.
+Two panels sit behind the bands. The Python numbers are the published ones. The C
+numbers are this project's own, measured whole-tree so the bands could be checked
+on code nobody wrote for a benchmark.
 
-| Repo | Language | Coverage | Verbosity | Erosion | Granularity |
+| Signal | Python panel (44 repos) | C panel (11 repos) |
+|---|---|---|
+| Verbosity, human / agent | 0.15 / 0.33 | 0.13 / 0.43 |
+| Erosion, human / agent | 0.31 / 0.68 | 0.69 / 0.97 |
+| Granularity, human band | 0.27 +/- 0.13 | 0.40 +/- 0.09 |
+
+The Python value is the panel mean. The C value is the panel median, and the C
+agent line is the worst maintained repository measured, because there are no C
+agent runs. Two differences between the panels matter when reading a C report:
+
+- Erosion in C runs about twice the Python level, a median of 0.69 against 0.31.
+  Long functions with switch-driven control flow are ordinary C. The metric
+  charges that complexity to the named function holding it.
+- Granularity in C also reads higher, 0.40 against 0.27. C keeps many small
+  `static` helpers with a single caller, which the metric counts as single-use.
+  A C repo does not leave that band by inlining its helpers; it leaves it by
+  making the code worse.
+
+### The C panel
+
+Eleven maintained repositories, cloned shallow and measured whole tree at the
+commit below. Coverage is the share of non-blank lines that reached the metrics.
+The gate is the same 60% the tool uses. Below that, the numbers describe a sliver
+of the tree.
+
+| Repo | Commit | Coverage | Verbosity | Erosion | Granularity |
 |---|---|---|---|---|---|
-| flask | Python | 80/80 | 0.017 | 0.234 | 0.254 |
-| requests | Python | 36/36 | 0.006 | 0.234 | 0.269 |
-| click | Python | 85/85 | 0.013 | 0.278 | 0.252 |
-| TinyGL | C | 36/51 | 0.120 | 0.471 | 0.663 |
-| nginx | C | 298/413 | refused | refused | refused |
-| tinyemu | C | 66/91 | refused | refused | refused |
-| quickjs, mquickjs, libbf, tcc | C, JS | 11-20% | refused | refused | refused |
+| lua | 7579fc9 | 99% | 0.035 | 0.501 | 0.285 |
+| zstd | ee650ef | 94% | 0.193 | 0.890 | 0.386 |
+| cJSON | 6d9f244 | 93% | 0.426 | 0.387 | 0.269 |
+| git | f0ef1b9 | 87% | 0.046 | 0.679 | 0.399 |
+| jq | 1b4109b | 76% | 0.209 | 0.929 | 0.333 |
+| duktape | 3afa016 | 75% | 0.099 | 0.396 | 0.304 |
+| zlib | e3dc0a8 | 69% | 0.135 | 0.828 | 0.415 |
+| wrk | a211dd5 | 68% | 0.204 | 0.972 | 0.522 |
+| htop | ea817e2 | 65% | 0.078 | 0.745 | 0.474 |
+| libuv | e15526a | 65% | 0.130 | 0.457 | 0.481 |
+| curl | 445aa87 | 62% | 0.110 | 0.687 | 0.431 |
 
-The three Python repos land inside the human band on all three signals, and
-their granularity (0.25-0.27) sits on the panel mean. Use them as the check that
-a scope is being read the same way the bands were.
+The median row is the band's human line: verbosity 0.13, erosion 0.69,
+granularity 0.40. The worst row is the band's agent line: verbosity 0.43
+(cJSON), erosion 0.97 (wrk).
 
-TinyGL is the only C project that clears the coverage gate. Its verbosity sits
-below the human baseline, its erosion sits between the human and agent bands,
-and its granularity is far above the human band. Read that last number with
-care: C keeps many small `static` helpers with a single caller by design, and
-the band came from a Python panel. A high granularity reading in C or C++ is a
-fact about the language before it is a fact about the code.
+Two things about that coverage column. First, most of what a C run cannot parse
+is platform code that no single machine compiles: libuv's `src/win`, htop's
+`linux/` and `freebsd/`, zstd's `contrib/linux-kernel`. The missing lines are not
+a sample of the code the repo builds on the machine measuring it. Second, every
+repo in the panel was given its own compile context first, one of three ways:
 
-The refused C projects fail for one reason. tree-sitter-c cannot represent
-`#if` inside an initializer or a declaration. In every one of them, the largest
-hand-written files are the skipped ones, so the surviving subset would flatter
-the repo. That is what exit 3 is for.
+- `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`, which is what curl, json-c and
+  libgit2 got. The database carries the exact flags the build uses per file.
+- The project's own build output, for nginx: `auto/configure`, then `-Iobjs` and
+  the module directories in `.sloptrack-cflags`.
+- A hand-written `.sloptrack-cflags`, for the rest. git needed `-DNO_OPENSSL` and
+  its generated `version.h`; zstd needed one `-I` per library directory; zlib
+  needed `./configure` and `-DHAVE_UNISTD_H`.
+
+Four more repositories were measured and fell below the gate, so their numbers
+are not in the band: redis (32%), json-c (52%), libgit2 (13%), tmux (17%). Each
+needs a generated header or a third-party include directory the tool never
+found: redis wants `deps/xxhash` and still trips over a redefinition in `sds.h`,
+json-c wants its CMake-generated `json_config.h`, libgit2 refuses to configure
+without an HTTPS backend, and tmux wants libevent plus a generated `config.h`.
 
 ## What the benchmark found
 
@@ -232,20 +270,27 @@ code that uses function expressions rather than arrow functions.
 The analyzer reads the repo, finds which languages are present, and asks `uvx`
 for only the grammars it needs.
 
-| Language | Grammar package | Verbosity | Erosion |
-|---|---|---|---|
-| Python | `tree-sitter-python` | clone only | yes |
-| JavaScript / TypeScript | `tree-sitter-javascript`, `tree-sitter-typescript` | clone only | yes |
-| Ruby | `tree-sitter-ruby` | clone only | yes |
-| Go | `tree-sitter-go` | clone only | yes |
-| Rust | `tree-sitter-rust` | clone only | yes |
-| Java | `tree-sitter-java` | clone only | yes |
-| C / C++ | `tree-sitter-c`, `tree-sitter-cpp` | clone only | yes |
-| C# | `tree-sitter-c-sharp` | clone only | yes |
-| PHP | `tree-sitter-php` | clone only | yes |
-| Kotlin, Swift, Scala, Lua | `tree-sitter-kotlin`, `-swift`, `-scala`, `-lua` | clone only | yes |
-| Haskell, Zig | `tree-sitter-haskell`, `tree-sitter-zig` | clone only | yes |
-| Bash | `tree-sitter-bash` | clone only | yes |
+| Language | Parser | Grammar package | Verbosity | Erosion |
+|---|---|---|---|---|
+| Python | Tree-sitter | `tree-sitter-python` | clone only | yes |
+| JavaScript / TypeScript | Tree-sitter | `tree-sitter-javascript`, `tree-sitter-typescript` | clone only | yes |
+| Ruby | Tree-sitter | `tree-sitter-ruby` | clone only | yes |
+| Go | Tree-sitter | `tree-sitter-go` | clone only | yes |
+| Rust | Tree-sitter | `tree-sitter-rust` | clone only | yes |
+| Java | Tree-sitter | `tree-sitter-java` | clone only | yes |
+| C / C++ | clang's front end | none needed | clone only | yes |
+| C# | Tree-sitter | `tree-sitter-c-sharp` | clone only | yes |
+| PHP | Tree-sitter | `tree-sitter-php` | clone only | yes |
+| Kotlin, Swift, Scala, Lua | Tree-sitter | `tree-sitter-kotlin`, `-swift`, `-scala`, `-lua` | clone only | yes |
+| Haskell, Zig | Tree-sitter | `tree-sitter-haskell`, `tree-sitter-zig` | clone only | yes |
+| Bash | Tree-sitter | `tree-sitter-bash` | clone only | yes |
+
+C and C++ are the exception: there the compiler is the parser. `clang
+-fsyntax-only -Xclang -ast-dump` yields function boundaries, branch counts, and
+call sites, and it reads what a context-free grammar cannot express: a macro used
+as a type, `#if` inside an initializer, a computed `goto`. The price is that the
+file must compile, which is what `.sloptrack-cflags` and `compile_commands.json`
+are for.
 
 The script refuses to report a metric when a language parses but yields zero
 functions. That combination means the node types in the table are wrong for
@@ -507,14 +552,23 @@ genuinely easier to change.
   deliberate. Tree-sitter recovery is not local, so a partly-broken file can
   still yield a bogus span that swallows a valid function. One attempt at
   measuring quickjs in pieces reported `JS_CallInternal` at 3,574 SLOC and
-  CC 462, where the real function is a fraction of that. C triggers this with
-  `#if` inside initializers and declarations. nginx, quickjs, mquickjs, tcc,
-  tinyemu, and libbf all read as unmeasurable for that reason. TinyGL is the one
-  C project measured here that clears the gate.
-- **The bands come from a Python panel.** The panel behind verbosity and erosion is 48
-  maintained Python repositories. A language with different idioms can sit
-  outside its range without being worse. C is the known case, where
-  single-use `static` helpers are normal.
+  CC 462, where the real function is a fraction of that.
+- **C and C++ need a compilable context.** Those two languages are read by
+  clang's front end rather than Tree-sitter, and clang refuses a file it cannot
+  compile: a missing `config.h`, a third-party header, or a macro the build
+  system supplies turns into `unknown type name` and a whole file dropped. Run
+  the project's configure step and export `compile_commands.json`, or write the
+  missing flags into `.sloptrack-cflags`. Without one of those, a real C project
+  measures at a fraction of its lines and exits 3. A header that only compiles
+  inside its including file is refused the same way, which is why header count
+  shows up in the coverage line for C runs.
+- **Two panels, not one.** Verbosity and erosion come from either the published
+  Python panel or this project's C panel, and the report names which one. The
+  Python panel is 44 maintained Python repositories; the C panel is 11
+  maintained C repositories at 60% coverage or better, pinned in the section
+  above. A language with different idioms can sit outside the Python range
+  without being worse, and C is the measured case: single-use `static` helpers
+  are normal there, so its granularity band starts at 0.31, not 0.14.
 
 - **Static only.** No tests, no runtime behavior, no correctness. Code can
   score well here and still be broken.

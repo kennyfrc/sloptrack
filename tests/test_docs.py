@@ -32,10 +32,23 @@ def test_the_coverage_gate_is_documented():
 def test_the_published_bands_are_documented():
     """Every band the report compares against has to appear in REFERENCE.md."""
     text = REFERENCE.read_text(encoding="utf-8")
-    for signal, band in measure.BANDS.items():
-        assert f"{band['human']:.2f}" in text, f"{signal} human band is missing"
-        if band["agent"] is not None:
-            assert f"{band['agent']:.2f}" in text, f"{signal} agent band is missing"
+    for family, bands in measure.BANDS.items():
+        for signal, band in bands.items():
+            assert f"{band['human']:.2f}" in text, f"{family} {signal} human band is missing"
+            if band["agent"] is not None:
+                assert f"{band['agent']:.2f}" in text, f"{family} {signal} agent band is missing"
+
+
+def test_the_c_panel_is_pinned_in_the_reference():
+    """The C band is a measurement, so the panel behind it is documented too.
+
+    A band whose panel is not written down cannot be checked later, and the
+    numbers would drift without anyone able to say when.
+    """
+    text = REFERENCE.read_text(encoding="utf-8")
+    for repo in ("lua", "zstd", "cJSON", "git", "jq", "duktape", "zlib", "wrk",
+                 "htop", "libuv", "curl"):
+        assert f"| {repo} |" in text, f"the C panel is missing {repo}"
 
 
 def test_the_high_complexity_cutoff_is_documented():

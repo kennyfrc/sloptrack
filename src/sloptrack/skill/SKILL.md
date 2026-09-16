@@ -62,6 +62,21 @@ installed. Without it you get SLOC and git growth and nothing else. The path is
 relative to this skill's directory; in a source checkout the same file is
 `src/sloptrack/measure.py`.
 
+C and C++ do not use Tree-sitter. When a `clang` binary is on PATH, the tool
+parses those files with clang's own front end, which is the only parser that
+reads a macro used as a type, `#if` inside an initializer, or a computed `goto`.
+Nothing extra to install: `cc`, `clang`, or Apple's developer tools already
+provide it, and `SLOPTRACK_CLANG` overrides which binary is used. Two things
+make C runs come out right:
+
+- The files have to compile. A file that needs the project's generated
+  `config.h` is skipped whole and named in the coverage section. Run the
+  project's configure step and export `compile_commands.json` (CMake:
+  `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`; anything else: `bear -- make`), or write
+  the missing flags one per line into `.sloptrack-cflags` at the repo root.
+- C repos are read against the C reference panel, not the Python bands. The
+  report says which panel it used on the `bands` line.
+
 The language table is verified with one fixture per language:
 
 ```bash
@@ -80,8 +95,8 @@ printed above it describe a subset, not the repo.
 ## Read the report
 
 ```
-VERBOSITY   0.474   in or above agent band   (3.16x the human baseline)
-EROSION     0.534   between human and agent bands   (1.72x the human baseline)
+VERBOSITY   0.474   in or above agent band   (3.16x the reference)
+EROSION     0.534   between human and agent bands   (1.72x the reference)
 GRANULARITY 0.24    within human band   (human 0.27 +/- 0.13)
 ```
 
@@ -98,7 +113,15 @@ Eleven lines carry the meaning. Read them before anything else:
    files. Check them: if they are the files the change touches, the numbers do
    not describe the work. Skipping is not local either. Tree-sitter can wrap a
    valid function into a bogus 3,574-line span before it hits the error, so a
-   partly-broken file is never measured in pieces. C is the usual cause.
+   partly-broken file is never measured in pieces. On the C and C++ path the
+   reason line is clang's own error, so a missing `config.h` reads as
+   `unknown type name` or `must have #include <config.h>`; that is a build
+   context problem, not a broken repo.
+3b. **The `bands` line.** Which reference panel the three bands came from. C and
+   C++ runs use the maintained-C panel, whose lines mean "worse than every
+   maintained C repo measured" rather than "as bad as an agent". A repo that is
+   not mostly Python or C keeps the Python bands, and the line says so, because
+   those bands do not transfer to another language.
 4. **`EXCLUDED <language>`.** The grammar parsed the files but found no
    functions. Either the language table is wrong for that grammar, or the files
    are not valid in the language their extension claims. Both cases would
