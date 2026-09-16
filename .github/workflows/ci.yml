@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      # The grammar-dependent tests skip here; the next job installs and runs them.
+      - run: python -m pytest -q
+
+  grammars:
+    name: language fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Verify every language against its known-answer fixture
+        run: uvx --from . sloptrack check-languages --verbose
+      - name: Run the suite with all grammars installed
+        run: |
+          pkgs=$(python3 -c "import sys; sys.path.insert(0, 'src'); \
+            from sloptrack import measure; \
+            print(' '.join('--with ' + p for p in measure.grammar_packages({l.name for l in measure.LANGS})))")
+          uvx --with pytest --with "tree-sitter==0.25.2" $pkgs python3 -m pytest -q
+
+  package:
+    name: wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build --wheel
+      - name: The built wheel exposes the CLI and ships the skill
+        run: |
+          wheel=$(ls dist/*.whl)
+          uvx --from "$wheel" sloptrack --version
+          uvx --from "$wheel" sloptrack install-skill --dest dist/skills
+          test -f dist/skills/measure-then-fix-slop/SKILL.md
+          test -f dist/skills/measure-then-fix-slop/scripts/slop_measure.py
