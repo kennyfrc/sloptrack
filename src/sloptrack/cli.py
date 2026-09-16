@@ -12,8 +12,6 @@ can already import.
 
 from __future__ import annotations
 
-import contextlib
-import io
 import os
 import shutil
 import subprocess
@@ -100,13 +98,14 @@ def _wrapped(module, argv: list[str], packages_for: Callable[[list[str]], list[s
 
 
 def _measure_packages(argv: list[str]) -> list[str] | None:
-    """The grammar packages this measurement needs, or None if the path is bad."""
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        code = measure.main(["--print-requirements", *argv])
-    if code != 0:
+    """The grammar packages this measurement needs, or None when the path is bad."""
+    try:
+        args, target = measure.parse_request(argv)
+    except measure.InputError as exc:
+        for line in exc.lines():
+            print(line, file=sys.stderr)
         return None
-    return buf.getvalue().split()
+    return measure.required_grammars(args, target)
 
 
 def _under_uvx(script: Path, packages: list[str], args: list[str]) -> int:

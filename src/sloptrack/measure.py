@@ -1355,12 +1355,6 @@ def use_counts(analyzed: list[FileAnalysis]) -> dict[str, int]:
     return dict(counts)
 
 
-def apply_uses(functions: list[Func], counts: dict[str, int]) -> None:
-    """Stamp every callable with how many call sites it has."""
-    for func in functions:
-        func.uses = counts.get(func.name, 0)
-
-
 def clone_groups_by_digest(analyzed: list[FileAnalysis]) -> dict[str, list[tuple[str, int, int]]]:
     """Clone candidates grouped by structural hash, across every measured file."""
     groups: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
@@ -1411,7 +1405,9 @@ def compute_signals(functions: list[Func], analyzed: list[FileAnalysis]) -> Sign
     separately: they are entry points, exports, or dead code, and the metric cannot
     tell which.
     """
-    apply_uses(functions, use_counts(analyzed))
+    counts = use_counts(analyzed)
+    for callable_ in functions:
+        callable_.uses = counts.get(callable_.name, 0)
     split = split_by_use(functions)
     groups = clone_groups_by_digest(analyzed)
     clone_lines = duplicate_lines(analyzed, groups)
@@ -1450,6 +1446,11 @@ class UseSplit:
         return len(self.single_use) / len(self.used) if self.used else None
 
 
+def verbosity_value(clone_lines: int, sloc: int) -> float | None:
+    """Duplicated lines per measured SLOC, or None when nothing was parsed."""
+    return clone_lines / sloc if sloc else None
+
+
 def split_by_use(functions: list[Func]) -> UseSplit:
     """Partition callables by use count, which is what granularity measures."""
     used = [f for f in functions if f.uses >= 1]
@@ -1464,11 +1465,6 @@ def split_by_use(functions: list[Func]) -> UseSplit:
 def measured_sloc(analyzed: list[FileAnalysis]) -> int:
     """SLOC in the files the metrics trust."""
     return sum(result.sloc for result in analyzed)
-
-
-def verbosity_value(clone_lines: int, sloc: int) -> float | None:
-    """Duplicated lines per measured SLOC, or None when nothing was parsed."""
-    return clone_lines / sloc if sloc else None
 
 
 def grammar_packages(languages: set[str]) -> list[str]:
